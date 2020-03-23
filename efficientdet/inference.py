@@ -84,13 +84,34 @@ def build_inputs(image_path_pattern: Text, image_size: int):
     (raw_images, images, scales): raw images, processed images, and scales.
   """
   raw_images, images, scales = [], [], []
-  for f in tf.io.gfile.glob(image_path_pattern):
+  filenames = tf.io.gfile.glob(image_path_pattern)
+  for f in filenames:
     image = Image.open(f)
     raw_images.append(image)
     image, scale = image_preprocess(image, image_size)
     images.append(image)
     scales.append(scale)
-  return raw_images, tf.stack(images), tf.stack(scales)
+  return raw_images, tf.stack(images), tf.stack(scales), filenames
+
+
+def build_inputs_from_tensor(image_paths, image_size: int):
+  """Read and preprocess input images.
+
+  Args:
+    image_path_pattern: a path to indicate a single or multiple files.
+    image_size: a single integer for image width and height.
+
+  Returns:
+    (raw_images, images, scales): raw images, processed images, and scales.
+  """
+  raw_images, images, scales = [], [], []
+  for f in image_paths:
+    image = Image.open(f)
+    raw_images.append(image)
+    image, scale = image_preprocess(image, image_size)
+    images.append(image)
+    scales.append(scale)
+  return raw_images, tf.stack(images), tf.stack(scales), image_paths
 
 
 def build_model(model_name: Text, inputs: tf.Tensor, **kwargs):
@@ -231,19 +252,19 @@ class InferenceDriver(object):
     self.params = hparams_config.get_detection_config(self.model_name).as_dict()
     self.params.update(dict(is_training_bn=False, use_bfloat16=False))
 
-  def inference(self, image_path_pattern: Text, output_dir: Text):
+  def inference(self, image_path_pattern: Text, output_dir: Text, visualize_results: bool = True):
     """Read and preprocess input images."""
     params = copy.deepcopy(self.params)
     with tf.Session() as sess:
       # Buid inputs and preprocessing.
-      raw_images, images, scales = build_inputs(
+      raw_images, images, scales, filenames = build_inputs(
           image_path_pattern, params['image_size'])
 
       # Build model.
       class_outputs, box_outputs = build_model(
           self.model_name, images, **self.params)
       restore_ckpt(sess, self.ckpt_path, enable_ema=True, export_ckpt=None)
-      params.update(dict(batch_size=1))  # required by postprocessing.
+      params.update(dict(batch_size=images.shape[0]))  # required by postprocessing.
 
       # Build postprocessing.
       detections_batch = det_post_process(
@@ -251,19 +272,59 @@ class InferenceDriver(object):
       outputs_np = sess.run(detections_batch)
 
       # Visualize results.
-      for i, output_np in enumerate(outputs_np):
-        # output_np has format [image_id, x, y, width, height, score, class]
-        boxes = output_np[:, 1:5]
-        classes = output_np[:, 6].astype(int)
-        scores = output_np[:, 5]
-        # convert [x, y, width, height] to [ymin, xmin, ymax, xmax]
-        # TODO(tanmingxing): make this convertion more efficient.
-        boxes[:, [0, 1, 2, 3]] = boxes[:, [1, 0, 3, 2]]
-        boxes[:, 2:4] += boxes[:, 0:2]
-        img = visualize_image(
-            raw_images[i], boxes, classes, scores, self.label_id_mapping)
-        output_image_path = os.path.join(output_dir, str(i) + '.jpg')
-        Image.fromarray(img).save(output_image_path)
-        tf.logging.info('writing file to {}'.format(output_image_path))
+      if visualize_results:
+        for i, output_np in enumerate(outputs_np):
+          # output_np has format [image_id, x, y, width, height, score, class]
+          boxes = output_np[:, 1:5]
+          classes = output_np[:, 6].astype(int)
+          scores = output_np[:, 5]
+          # convert [x, y, width, height] to [ymin, xmin, ymax, xmax]
+          # TODO(tanmingxing): make this convertion more efficient.
+          boxes[:, [0, 1, 2, 3]] = boxes[:, [1, 0, 3, 2]]
+          boxes[:, 2:4] += boxes[:, 0:2]
+          img = visualize_image(
+              raw_images[i], boxes, classes, scores, self.label_id_mapping)
+          output_image_path = os.path.join(output_dir, str(i) + '.jpg')
+          Image.fromarray(img).save(output_image_path)
+          tf.logging.info('writing file to {}'.format(output_image_path))
 
-      return outputs_np
+      return filenames, outputs_np
+
+  def inference_dataset(self, dataset: tf.data.Dataset, output_dir: Text, visualize_results: bool = True, batch_size: int = 1):
+    """Read and preprocess input images."""
+    params = copy.deepcopy(self.params)
+    dataset = dataset.batch(batch_size)
+    iterator = dataset.make_one_shot_iterator()
+    next_batch = iterator.get_next()
+    inputs_shape = [batch_size, params['image_size'], params['image_size'], 3]
+
+    batch_filenames = []
+    batch_outputs = []
+    with tf.Session() as sess:
+      # Build model.
+      input = tf.placeholder(tf.float32, name='input', shape=inputs_shape)
+      class_outputs, box_outputs = build_model(
+          self.model_name, input, **self.params)
+      restore_ckpt(sess, self.ckpt_path, enable_ema=True, export_ckpt=None)
+      params.update(dict(batch_size=batch_size))  # required by postprocessing.
+
+      try:
+        while True:
+          inputs = sess.run(next_batch)
+          # Buid inputs and preprocessing.
+          raw_images, images, scales, filenames = build_inputs_from_tensor(inputs, params['image_size'])
+
+          # Build postprocessing.
+          detections_batch = det_post_process(
+            params, class_outputs, box_outputs, scales)
+
+          outputs_np = sess.run(detections_batch, {
+            input: sess.run(images),
+          })
+
+          batch_filenames.extend(filenames)
+          batch_outputs.extend(outputs_np)
+      except tf.errors.OutOfRangeError:
+        pass
+
+      return batch_filenames, batch_outputs

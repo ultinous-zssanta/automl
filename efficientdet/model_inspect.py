@@ -51,7 +51,10 @@ flags.DEFINE_string('export_ckpt', None, 'Path for exporting new models.')
 flags.DEFINE_bool('enable_ema', True, 'Use ema variables for eval.')
 
 flags.DEFINE_string('input_image', None, 'Input image path for inference.')
+flags.DEFINE_string('input_list', None, 'Input image list (path of txt file).')
 flags.DEFINE_string('output_image_dir', None, 'Output dir for inference.')
+flags.DEFINE_float('person_confidence_threshold', 0.5, 'Lower bound for person confidence.')
+flags.DEFINE_string('output_csv_name', "output.csv", 'Name of output csv (inference).')
 
 FLAGS = flags.FLAGS
 
@@ -165,9 +168,14 @@ class ModelInspector(object):
       self.restore_model(
           sess, self.ckpt_path, self.enable_ema, self.export_ckpt)
 
-  def inference_single_image(self, image_image_path, output_dir):
+  def inference_single_image(self, image_image_path, output_dir, visualize_results=True):
     driver = inference.InferenceDriver(self.model_name, self.ckpt_path)
-    driver.inference(image_image_path, output_dir)
+    return driver.inference(image_image_path, output_dir, visualize_results)
+
+  def inference_dataset(self, image_image_path, output_dir, visualize_results=True):
+    driver = inference.InferenceDriver(self.model_name, self.ckpt_path)
+    return driver.inference_dataset(image_image_path, output_dir, visualize_results)
+
 
   def freeze_model(self) -> Tuple[Text, Text]:
     """Freeze model and convert them into tflite and tf graph."""
@@ -269,6 +277,29 @@ class ModelInspector(object):
     goutput = tf.import_graph_def(infer_graph, return_elements=fetches)
     return goutput
 
+  @staticmethod
+  def convert_to_bbox_format(fname, boxes, scores, delimiter="\t"):
+    my_boxes = boxes.copy()
+    my_boxes[:, 2:4] += boxes[:, 0:2]
+    return delimiter.join([fname] + [("%.3f" % x) for x in np.hstack((my_boxes, scores[:, np.newaxis])).flatten()])
+
+  def filter_and_dump_results_to_csv(self, filenames, outputs_np, output_name, person_confidence_threshold):
+    with open(output_name, "w") as fp:
+      lines = []
+      for fname, output_np in zip(filenames, outputs_np):
+        if not isinstance(fname, str):
+          fname = fname.decode("utf-8")
+        boxes = output_np[:, 1:5]
+        classes = output_np[:, 6].astype(int)
+        scores = output_np[:, 5]
+        people = classes == 1
+        valid_scores = scores > person_confidence_threshold
+        boxes = boxes[people & valid_scores, :]
+        scores = scores[people & valid_scores]
+        lines.append(self.convert_to_bbox_format(fname, boxes, scores))
+      fp.write("\n".join(lines))
+      fp.write("\n")
+
   def run_model(self, runmode, threads=0):
     """Run the model on devices."""
     if runmode == 'dry':
@@ -280,6 +311,20 @@ class ModelInspector(object):
       self.eval_ckpt()
     elif runmode == 'infer':
       self.inference_single_image(FLAGS.input_image, FLAGS.output_image_dir)
+    elif runmode == 'infer_and_write_boxes':
+      if FLAGS.input_image:
+        dataset = tf.data.Dataset.list_files(FLAGS.input_image)
+      elif FLAGS.input_list:
+        dataset = tf.data.TextLineDataset(FLAGS.input_list)
+      else:
+        raise RuntimeError("No dataset given for inference")
+      filenames, outputs_np = self.inference_dataset(dataset, FLAGS.output_image_dir, False)
+      self.filter_and_dump_results_to_csv(
+        filenames,
+        outputs_np,
+        os.path.join(FLAGS.output_image_dir, FLAGS.output_csv_name),
+        FLAGS.person_confidence_threshold
+      )
     elif runmode == 'bm':
       self.benchmark_model(warmup_runs=5, bm_runs=FLAGS.bm_runs,
                            num_threads=threads,
