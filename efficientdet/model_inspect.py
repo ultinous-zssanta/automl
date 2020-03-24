@@ -55,6 +55,7 @@ flags.DEFINE_string('input_list', None, 'Input image list (path of txt file).')
 flags.DEFINE_string('output_image_dir', None, 'Output dir for inference.')
 flags.DEFINE_float('person_confidence_threshold', 0.5, 'Lower bound for person confidence.')
 flags.DEFINE_string('output_csv_name', "output.csv", 'Name of output csv (inference).')
+flags.DEFINE_integer('infer_batch_size', 1, 'Batch size for inference.')
 
 FLAGS = flags.FLAGS
 
@@ -172,10 +173,9 @@ class ModelInspector(object):
     driver = inference.InferenceDriver(self.model_name, self.ckpt_path)
     return driver.inference(image_image_path, output_dir, visualize_results)
 
-  def inference_dataset(self, image_image_path, output_dir, visualize_results=True):
+  def inference_dataset(self, image_image_path, output_dir, visualize_results=True, infer_batch_size=1):
     driver = inference.InferenceDriver(self.model_name, self.ckpt_path)
-    return driver.inference_dataset(image_image_path, output_dir, visualize_results)
-
+    return driver.inference_dataset(image_image_path, output_dir, visualize_results, infer_batch_size)
 
   def freeze_model(self) -> Tuple[Text, Text]:
     """Freeze model and convert them into tflite and tf graph."""
@@ -318,7 +318,7 @@ class ModelInspector(object):
         dataset = tf.data.TextLineDataset(FLAGS.input_list)
       else:
         raise RuntimeError("No dataset given for inference")
-      filenames, outputs_np = self.inference_dataset(dataset, FLAGS.output_image_dir, False)
+      filenames, outputs_np = self.inference_dataset(dataset, FLAGS.output_image_dir, False, FLAGS.infer_batch_size)
       self.filter_and_dump_results_to_csv(
         filenames,
         outputs_np,
