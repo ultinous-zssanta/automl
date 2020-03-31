@@ -27,7 +27,19 @@ import tensorflow.compat.v2 as tf2
 
 from tensorflow.python.tpu import tpu_function  # pylint:disable=g-direct-tensorflow-import
 
-relu_fn = tf.nn.swish
+
+def _decide_swish():
+  import semver
+  tf_version = tf.__version__
+  is_tf_2x = semver.compare(tf_version, "2.0.0") >= 0
+  if (is_tf_2x and semver.compare(tf_version, "2.1.0") >= 0) or \
+     (not is_tf_2x and semver.compare(tf_version, "1.15.0") >= 0):
+    return tf.nn.swish
+  else:
+    return lambda x: x * tf.sigmoid(x)
+
+
+relu_fn = _decide_swish()
 backbone_relu_fn = relu_fn
 
 
