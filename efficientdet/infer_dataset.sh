@@ -11,7 +11,7 @@ INFER_BATCH_SIZE=${3-1}
 SCRIPT_PATH=$( dirname $(realpath $0) )
 
 PYTHONPATH=${SCRIPT_PATH} python ${SCRIPT_PATH}/model_inspect.py \
-	 --runmode="infer_and_write_boxes" \
+	 --runmode="infer_test" \
 	 --model_name=${MODEL_NAME} \
 	 --ckpt_path="${SCRIPT_PATH}/models/${MODEL_NAME}/" \
 	 --output_image_dir="${SCRIPT_PATH}/test/output/" \

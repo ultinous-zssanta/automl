@@ -314,6 +314,10 @@ class InferenceDriver(object):
           images, scales = build_inputs_from_list(inputs, params['image_size'], params["batch_size"])
           filenames = inputs
 
+          if images.shape[0] < batch_size:
+            dummy = [tf.zeros(inputs_shape[1::], dtype=tf.dtypes.float32) for _ in range(batch_size-images.shape[0])]
+            images = tf.concat([images, tf.stack(dummy)], 0)
+
           # Build postprocessing.
           detections_batch = det_post_process(
             params, class_outputs, box_outputs, scales)
@@ -327,3 +331,178 @@ class InferenceDriver(object):
         pass
 
 
+def _numpy_image_loader(filepaths, target_size, target_batch_size=1):
+  def _resize(img, target_size):
+    scale_factor = float(target_size) / max(img.width, img.height)
+    scaled_width = min(int(img.width * scale_factor), target_size)
+    scaled_height = min(int(img.height * scale_factor), target_size)
+
+    result = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+    result[0:scaled_height, 0:scaled_width, :] = np.array(img.resize((scaled_width, scaled_height), Image.BILINEAR))
+    return result, 1.0 / scale_factor
+
+  def _normalize_image(img):
+    img = np.array(img)
+    scaled = img.astype(np.float32) / 255.0
+    scaled -= np.array([0.485, 0.456, 0.406])
+    scaled /= np.array([0.229, 0.224, 0.225])
+    return Image.fromarray(scaled)
+
+  if np.isscalar(filepaths):
+    filepaths = [filepaths]
+
+  assert len(filepaths) <= target_batch_size
+  filenames = [fname.decode("utf-8") for fname in filepaths]
+  images, scales = [], []
+  for fname in filenames:
+    raw = Image.open(fname)
+    norm = _normalize_image(raw)
+    resized, scale = _resize(norm, target_size)
+    images.append(np.array(resized))
+    scales.append(scale)
+  for _ in range(target_batch_size-len(images)):
+    images.append(np.zeros((target_size, target_size, 3), dtype=np.float32))
+    scales.append(-1)
+  return np.concatenate([a[np.newaxis, ...] for a in images]), np.array(scales, dtype=np.float32), filenames
+
+
+def _tf_loader(filepaths, target_size, target_batch_size=1):
+  assert len(filepaths) <= target_batch_size
+  filenames = [fname.decode("utf-8") for fname in filepaths]
+  images = []
+  for fname in filenames:
+    raw = Image.open(fname)
+    img_np = np.array(raw, dtype=np.uint8).squeeze()
+    if len(img_np.shape) == 2:
+      img_np = np.tile(img_np[..., np.newaxis], [1, 1, 3])
+    elif len(img_np.shape) != 3:
+      raise ValueError("Invalid image given: {}".format(fname))
+    images.append(img_np)
+  for _ in range(target_batch_size-len(images)):
+    images.append(np.zeros((target_size, target_size, 3), dtype=np.uint8))
+  return tuple(images) + (filenames,)
+
+
+def det_post_process_node(params: Dict[Any, Any], cls_outputs: Dict[int, tf.Tensor],
+                     box_outputs: Dict[int, tf.Tensor], scales: tf.Tensor):
+  """Post preprocessing the box/class predictions.
+
+  Args:
+    params: a parameter dictionary that includes `min_level`, `max_level`,
+      `batch_size`, and `num_classes`.
+    cls_outputs: an OrderDict with keys representing levels and values
+      representing logits in [batch_size, height, width, num_anchors].
+    box_outputs: an OrderDict with keys representing levels and values
+      representing box regression targets in
+      [batch_size, height, width, num_anchors * 4].
+    scales: a list of float values indicating image scale.
+
+  Returns:
+    detections_batch: a batch of detection results. Each detection is a tensor
+      with each row representing [image_id, x, y, width, height, score, class].
+  """
+  outputs = {'cls_outputs_all': [None], 'box_outputs_all': [None],
+             'indices_all': [None], 'classes_all': [None]}
+  det_model_fn.add_metric_fn_inputs(
+      params, cls_outputs, box_outputs, outputs)
+
+  # Create anchor_label for picking top-k predictions.
+  eval_anchors = anchors.Anchors(params['min_level'],
+                                 params['max_level'],
+                                 params['num_scales'],
+                                 params['aspect_ratios'],
+                                 params['anchor_scale'],
+                                 params['image_size'])
+  anchor_labeler = anchors.AnchorLabeler(eval_anchors, params['num_classes'])
+
+  # Add all detections for each input image.
+  detections_batch = []
+  for index in range(params["batch_size"]):
+    cls_outputs_per_sample = outputs['cls_outputs_all'][index]
+    box_outputs_per_sample = outputs['box_outputs_all'][index]
+    indices_per_sample = outputs['indices_all'][index]
+    classes_per_sample = outputs['classes_all'][index]
+    detections = anchor_labeler.generate_detections(
+        cls_outputs_per_sample, box_outputs_per_sample, indices_per_sample,
+        classes_per_sample, image_id=[index], image_scale=[scales[index]])
+    detections_batch.append(detections)
+  return detections_batch
+
+
+class DatasetInferenceDriver(InferenceDriver):
+  def inference_dataset(self, dataset: tf.data.Dataset, batch_size: int = 1):
+    batch_filenames = []
+    batch_outputs = []
+    for ind, (filenames, outputs) in enumerate(self.inference_dataset_batch(dataset, batch_size)):
+      batch_filenames.extend(filenames)
+      batch_outputs.extend(outputs)
+      print("Batch %d finished." % ind)
+    return batch_filenames, batch_outputs
+
+  def inference_dataset_batch(self, dataset: tf.data.Dataset, batch_size: int = 1):
+    """Read and preprocess input images."""
+    params = copy.deepcopy(self.params)
+
+    dataset = dataset.filter(lambda x: tf.math.not_equal(tf.strings.length(x), 0))
+    dataset = dataset.batch(batch_size)
+    iterator = dataset.make_one_shot_iterator()
+    next_batch = iterator.get_next()
+    inputs_shape = [batch_size, params['image_size'], params['image_size'], 3]
+
+    with tf.Session() as sess:
+      # Case 1. numpy based approach
+      # - gives inferior results...
+      # inputs, scales, filenames = tf.py_func(_numpy_image_loader, [next_batch, params['image_size'], batch_size],
+      #                             (tf.float32, tf.float32, tf.string))
+      # inputs.set_shape(inputs_shape)
+      # scales.set_shape(batch_size)
+
+      # Case 2. TF graph based approach
+      # - not working due to https://github.com/tensorflow/tensorflow/issues/36963
+      image_outputs = tf.py_func(_tf_loader, [next_batch, params['image_size'], batch_size],
+                                  [tf.uint8] * batch_size + [tf.string])
+      filenames = image_outputs[-1]
+      inputs_arr = []
+      scales_arr = []
+      for i in range(batch_size):
+        image_outputs[i].set_shape([None, None, 3])
+        img, scale = image_preprocess(image_outputs[i], params["image_size"])
+        inputs_arr.append(img)
+        scales_arr.append(scale)
+      inputs = tf.stack(inputs_arr)
+      scales = tf.stack(scales_arr)
+
+      # Case 3. Placeholder approach
+      # - leaks memory... (image extraction phase)
+      # inputs = tf.placeholder(shape=inputs_shape, dtype=np.float32, name="inputs")
+      # scales = tf.placeholder(shape=(batch_size, ), dtype=np.float32, name="scales")
+
+      # Common
+      class_outputs, box_outputs = build_model(
+        self.model_name, inputs, **self.params)
+      restore_ckpt(sess, self.ckpt_path, enable_ema=True, export_ckpt=None)
+      params.update(dict(batch_size=batch_size))  # required by postprocessing.
+
+      detections_batch = det_post_process_node(
+        params, class_outputs, box_outputs, scales
+      )
+
+      try:
+        while True:
+          # For Case 1-2
+          detections, files = sess.run([detections_batch, filenames])
+
+          # Case 3
+          # files = sess.run(next_batch)
+          # images, img_scales = build_inputs_from_list(files, params["image_size"], batch_size)
+          # images, img_scales = sess.run([images, img_scales])
+          #
+          # detections = sess.run(detections_batch, {
+          #   inputs: images,
+          #   scales: img_scales,
+          # })
+
+          # Common
+          yield files, detections[0:len(files)]
+      except tf.errors.OutOfRangeError:
+        pass

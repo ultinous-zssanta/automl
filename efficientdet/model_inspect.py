@@ -283,22 +283,21 @@ class ModelInspector(object):
     my_boxes[:, 2:4] += boxes[:, 0:2]
     return delimiter.join([fname] + [("%.3f" % x) for x in np.hstack((my_boxes, scores[:, np.newaxis])).flatten()])
 
-  def filter_and_dump_results_to_csv(self, filenames, outputs_np, output_name, person_confidence_threshold):
-    with open(output_name, "w") as fp:
-      lines = []
-      for fname, output_np in zip(filenames, outputs_np):
-        if not isinstance(fname, str):
-          fname = fname.decode("utf-8")
-        boxes = output_np[:, 1:5]
-        classes = output_np[:, 6].astype(int)
-        scores = output_np[:, 5]
-        people = classes == 1
-        valid_scores = scores > person_confidence_threshold
-        boxes = boxes[people & valid_scores, :]
-        scores = scores[people & valid_scores]
-        lines.append(self.convert_to_bbox_format(fname, boxes, scores))
-      fp.write("\n".join(lines))
-      fp.write("\n")
+  def filter_and_dump_results_to_csv(self, filenames, outputs_np, file_handle, person_confidence_threshold):
+    lines = []
+    for fname, output_np in zip(filenames, outputs_np):
+      if not isinstance(fname, str):
+        fname = fname.decode("utf-8")
+      boxes = output_np[:, 1:5]
+      classes = output_np[:, 6].astype(int)
+      scores = output_np[:, 5]
+      people = classes == 1
+      valid_scores = scores > person_confidence_threshold
+      boxes = boxes[people & valid_scores, :]
+      scores = scores[people & valid_scores]
+      lines.append(self.convert_to_bbox_format(fname, boxes, scores))
+    file_handle.write("\n".join(lines))
+    file_handle.write("\n")
 
   def run_model(self, runmode, threads=0):
     """Run the model on devices."""
@@ -320,12 +319,30 @@ class ModelInspector(object):
         raise RuntimeError("No dataset given for inference")
       filenames, outputs_np = self.inference_dataset(dataset, FLAGS.infer_batch_size)
       print(filenames)
-      self.filter_and_dump_results_to_csv(
-        filenames,
-        outputs_np,
-        os.path.join(FLAGS.output_image_dir, FLAGS.output_csv_name),
-        FLAGS.person_confidence_threshold
-      )
+      with open(os.path.join(FLAGS.output_image_dir, FLAGS.output_csv_name), "w") as fp:
+        self.filter_and_dump_results_to_csv(
+          filenames,
+          outputs_np,
+          fp,
+          FLAGS.person_confidence_threshold
+        )
+    elif runmode == 'infer_test':
+      if FLAGS.input_list:
+        dataset = tf.data.TextLineDataset(FLAGS.input_list)
+      else:
+        raise RuntimeError("No dataset given for inference")
+
+      driver = inference.DatasetInferenceDriver(self.model_name, self.ckpt_path)
+      with open(os.path.join(FLAGS.output_image_dir, FLAGS.output_csv_name), "w") as fp:
+        for ind, (filenames, outputs) in enumerate(driver.inference_dataset_batch(dataset, FLAGS.infer_batch_size)):
+          tf.logging.info("Batch %d is ready." % ind)
+          tf.logging.debug("Files: %s" % str(filenames))
+          self.filter_and_dump_results_to_csv(
+            filenames,
+            outputs,
+            fp,
+            FLAGS.person_confidence_threshold
+          )
     elif runmode == 'bm':
       self.benchmark_model(warmup_runs=5, bm_runs=FLAGS.bm_runs,
                            num_threads=threads,
