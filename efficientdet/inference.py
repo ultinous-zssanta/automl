@@ -94,24 +94,17 @@ def build_inputs(image_path_pattern: Text, image_size: int):
   return raw_images, tf.stack(images), tf.stack(scales), filenames
 
 
-def build_inputs_from_tensor(image_paths, image_size: int):
-  """Read and preprocess input images.
-
-  Args:
-    image_path_pattern: a path to indicate a single or multiple files.
-    image_size: a single integer for image width and height.
-
-  Returns:
-    (raw_images, images, scales): raw images, processed images, and scales.
-  """
-  raw_images, images, scales = [], [], []
+def build_inputs_from_list(image_paths, image_size: int, batch_size: int = 1):
+  images, scales = [], []
   for f in image_paths:
     image = Image.open(f)
-    raw_images.append(image)
     image, scale = image_preprocess(image, image_size)
     images.append(image)
     scales.append(scale)
-  return raw_images, tf.stack(images), tf.stack(scales), image_paths
+  for _ in range(batch_size-len(images)):
+    images.append(tf.zeros((image_size, image_size, 3), dtype=tf.float32))
+    scales.append(-1)
+  return tf.stack(images), tf.stack(scales)
 
 
 def build_model(model_name: Text, inputs: tf.Tensor, **kwargs):
@@ -290,7 +283,15 @@ class InferenceDriver(object):
 
       return filenames, outputs_np
 
-  def inference_dataset(self, dataset: tf.data.Dataset, output_dir: Text, visualize_results: bool = True, batch_size: int = 1):
+  def inference_dataset(self, dataset: tf.data.Dataset, batch_size: int = 1):
+    batch_filenames = []
+    batch_outputs = []
+    for filenames, outputs in self.inference_dataset_batch(dataset, batch_size):
+      batch_filenames.extend(filenames)
+      batch_outputs.extend(outputs)
+    return batch_filenames, batch_outputs
+
+  def inference_dataset_batch(self, dataset: tf.data.Dataset, batch_size: int = 1):
     """Read and preprocess input images."""
     params = copy.deepcopy(self.params)
     dataset = dataset.batch(batch_size)
@@ -298,8 +299,6 @@ class InferenceDriver(object):
     next_batch = iterator.get_next()
     inputs_shape = [batch_size, params['image_size'], params['image_size'], 3]
 
-    batch_filenames = []
-    batch_outputs = []
     with tf.Session() as sess:
       # Build model.
       input = tf.placeholder(tf.float32, name='input', shape=inputs_shape)
@@ -312,7 +311,8 @@ class InferenceDriver(object):
         while True:
           inputs = sess.run(next_batch)
           # Buid inputs and preprocessing.
-          raw_images, images, scales, filenames = build_inputs_from_tensor(inputs, params['image_size'])
+          images, scales = build_inputs_from_list(inputs, params['image_size'], params["batch_size"])
+          filenames = inputs
 
           # Build postprocessing.
           detections_batch = det_post_process(
@@ -322,9 +322,8 @@ class InferenceDriver(object):
             input: sess.run(images),
           })
 
-          batch_filenames.extend(filenames)
-          batch_outputs.extend(outputs_np)
+          yield filenames, outputs_np[0:len(filenames)]
       except tf.errors.OutOfRangeError:
         pass
 
-      return batch_filenames, batch_outputs
+
