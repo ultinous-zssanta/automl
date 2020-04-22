@@ -19,19 +19,30 @@ from __future__ import division
 # gtype import
 from __future__ import print_function
 
-
 import os
+import re
+from absl import logging
 import numpy as np
 import tensorflow.compat.v1 as tf
 import tensorflow.compat.v2 as tf2
+from typing import Text, Tuple, Union
 
 from tensorflow.python.tpu import tpu_function  # pylint:disable=g-direct-tensorflow-import
+# pylint: disable=logging-format-interpolation
 
-relu_fn = tf.nn.swish
-backbone_relu_fn = relu_fn
 
-_BATCH_NORM_DECAY = 0.997
-_BATCH_NORM_EPSILON = 1e-4
+def activation_fn(features: tf.Tensor, act_type: Text):
+  """Customized non-linear activation type."""
+  if act_type == 'swish':
+    return tf.nn.swish(features)
+  elif act_type == 'swish_native':
+    return features * tf.sigmoid(features)
+  elif act_type == 'relu':
+    return tf.nn.relu(features)
+  elif act_type == 'relu6':
+    return tf.nn.relu6(features)
+  else:
+    raise ValueError('Unsupported act_type {}'.format(act_type))
 
 
 class DepthwiseConv2D(tf.keras.layers.DepthwiseConv2D, tf.layers.Layer):
@@ -50,9 +61,21 @@ def get_ema_vars():
   return list(set(ema_vars))
 
 
-def get_ckt_var_map(ckpt_path, ckpt_scope, var_scope):
-  """Get a var map for restoring from pretrained checkpoints."""
-  tf.logging.info('Init model from checkpoint {}'.format(ckpt_path))
+def get_ckpt_var_map(ckpt_path, ckpt_scope, var_scope, var_exclude_expr=None):
+  """Get a var map for restoring from pretrained checkpoints.
+
+  Args:
+    ckpt_path: string. A pretrained checkpoint path.
+    ckpt_scope: string. Scope name for checkpoint variables.
+    var_scope: string. Scope name for model variables.
+    var_exclude_expr: string. A regex for excluding variables.
+      This is useful for finetuning with different classes, where
+      var_exclude_expr='.*class-predict.*' can be used.
+
+  Returns:
+    var_map: a dictionary from checkpoint name to model variables.
+  """
+  logging.info('Init model from checkpoint {}'.format(ckpt_path))
   if not ckpt_scope.endswith('/') or not var_scope.endswith('/'):
     raise ValueError('Please specific scope name ending with /')
   if ckpt_scope.startswith('/'):
@@ -65,26 +88,45 @@ def get_ckt_var_map(ckpt_path, ckpt_scope, var_scope):
   model_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=var_scope)
   reader = tf.train.load_checkpoint(ckpt_path)
   ckpt_var_names = set(reader.get_variable_to_shape_map().keys())
+
+  exclude_matcher = re.compile(var_exclude_expr) if var_exclude_expr else None
   for v in model_vars:
+    if exclude_matcher and exclude_matcher.match(v.op.name):
+      logging.info(
+          'skip {} -- excluded by {}'.format(v.op.name, var_exclude_expr))
+      continue
+
     if not v.op.name.startswith(var_scope):
-      tf.logging.info('skip {} -- does not match scope {}'.format(
+      logging.info('skip {} -- does not match scope {}'.format(
           v.op.name, var_scope))
     ckpt_var = ckpt_scope + v.op.name[len(var_scope):]
     if ckpt_var not in ckpt_var_names:
       if v.op.name.endswith('/ExponentialMovingAverage'):
         ckpt_var = ckpt_scope + v.op.name[:-len('/ExponentialMovingAverage')]
       if ckpt_var not in ckpt_var_names:
-        tf.logging.info('skip {} ({}) -- not in ckpt'.format(
-            v.op.name, ckpt_var))
+        logging.info('skip {} ({}) -- not in ckpt'.format(v.op.name, ckpt_var))
         continue
-    tf.logging.info('Init {} from ckpt var {}'.format(v.op.name, ckpt_var))
+
+    logging.info('Init {} from ckpt var {}'.format(v.op.name, ckpt_var))
     var_map[ckpt_var] = v
   return var_map
 
 
-def get_ckt_var_map_ema(ckpt_path, ckpt_scope, var_scope):
-  """Get a ema var map for restoring from pretrained checkpoints."""
-  tf.logging.info('Init model from checkpoint {}'.format(ckpt_path))
+def get_ckpt_var_map_ema(ckpt_path, ckpt_scope, var_scope, var_exclude_expr):
+  """Get a ema var map for restoring from pretrained checkpoints.
+
+  Args:
+    ckpt_path: string. A pretrained checkpoint path.
+    ckpt_scope: string. Scope name for checkpoint variables.
+    var_scope: string. Scope name for model variables.
+    var_exclude_expr: string. A regex for excluding variables.
+      This is useful for finetuning with different classes, where
+      var_exclude_expr='.*class-predict.*' can be used.
+
+  Returns:
+    var_map: a dictionary from checkpoint name to model variables.
+  """
+  logging.info('Init model from checkpoint {}'.format(ckpt_path))
   if not ckpt_scope.endswith('/') or not var_scope.endswith('/'):
     raise ValueError('Please specific scope name ending with /')
   if ckpt_scope.startswith('/'):
@@ -97,27 +139,31 @@ def get_ckt_var_map_ema(ckpt_path, ckpt_scope, var_scope):
   model_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=var_scope)
   reader = tf.train.load_checkpoint(ckpt_path)
   ckpt_var_names = set(reader.get_variable_to_shape_map().keys())
+  exclude_matcher = re.compile(var_exclude_expr) if var_exclude_expr else None
   for v in model_vars:
+    if exclude_matcher and exclude_matcher.match(v.op.name):
+      logging.info(
+          'skip {} -- excluded by {}'.format(v.op.name, var_exclude_expr))
+      continue
+
     if not v.op.name.startswith(var_scope):
-      tf.logging.info('skip {} -- does not match scope {}'.format(
+      logging.info('skip {} -- does not match scope {}'.format(
           v.op.name, var_scope))
 
     if v.op.name.endswith('/ExponentialMovingAverage'):
-      tf.logging.info('skip ema var {}'.format(v.op.name))
+      logging.info('skip ema var {}'.format(v.op.name))
       continue
 
     ckpt_var = ckpt_scope + v.op.name[len(var_scope):]
     ckpt_var_ema = ckpt_var + '/ExponentialMovingAverage'
     if ckpt_var_ema in ckpt_var_names:
       var_map[ckpt_var_ema] = v
-      tf.logging.info('Init {} from ckpt var {}'.format(
-          v.op.name, ckpt_var_ema))
+      logging.info('Init {} from ckpt var {}'.format(v.op.name, ckpt_var_ema))
     elif ckpt_var in ckpt_var_names:
       var_map[ckpt_var] = v
-      tf.logging.info('Init {} from ckpt var {}'.format(v.op.name, ckpt_var))
+      logging.info('Init {} from ckpt var {}'.format(v.op.name, ckpt_var))
     else:
-      tf.logging.info('skip {} ({}) -- not in ckpt'.format(
-          v.op.name, ckpt_var))
+      logging.info('skip {} ({}) -- not in ckpt'.format(v.op.name, ckpt_var))
   return var_map
 
 
@@ -136,8 +182,9 @@ class TpuBatchNormalization(tf.layers.BatchNormalization):
     group_assignment = None
     if num_shards_per_group > 1:
       if num_shards % num_shards_per_group != 0:
-        raise ValueError('num_shards: %d mod shards_per_group: %d, should be 0'
-                         % (num_shards, num_shards_per_group))
+        raise ValueError(
+            'num_shards: %d mod shards_per_group: %d, should be 0' %
+            (num_shards, num_shards_per_group))
       num_groups = num_shards // num_shards_per_group
       group_assignment = [[
           x for x in range(num_shards) if x // num_shards_per_group == y
@@ -155,14 +202,13 @@ class TpuBatchNormalization(tf.layers.BatchNormalization):
       num_shards_per_group = 1
     else:
       num_shards_per_group = max(8, num_shards // 8)
-    tf.logging.info('TpuBatchNormalization with num_shards_per_group {}'.format(
+    logging.info('TpuBatchNormalization with num_shards_per_group {}'.format(
         num_shards_per_group))
     if num_shards_per_group > 1:
       # Compute variance using: Var[X]= E[X^2] - E[X]^2.
       shard_square_of_mean = tf.math.square(shard_mean)
       shard_mean_of_square = shard_variance + shard_square_of_mean
-      group_mean = self._cross_replica_average(
-          shard_mean, num_shards_per_group)
+      group_mean = self._cross_replica_average(shard_mean, num_shards_per_group)
       group_mean_of_square = self._cross_replica_average(
           shard_mean_of_square, num_shards_per_group)
       group_variance = group_mean_of_square - tf.math.square(group_mean)
@@ -180,35 +226,41 @@ class BatchNormalization(tf.layers.BatchNormalization):
     super(BatchNormalization, self).__init__(**kwargs)
 
 
-def batch_norm_class(is_training):
-  if is_training:
+def batch_norm_class(is_training, use_tpu=False,):
+  if is_training and use_tpu:
     return TpuBatchNormalization
   else:
     return BatchNormalization
 
 
-def tpu_batch_normalization(inputs, training=False, **kwargs):
+def tpu_batch_normalization(inputs, training=False, use_tpu=False, **kwargs):
   """A wrapper for TpuBatchNormalization."""
-  layer = batch_norm_class(training)(**kwargs)
+  layer = batch_norm_class(training, use_tpu)(**kwargs)
   return layer.apply(inputs, training=training)
 
 
-def batch_norm_relu(inputs,
-                    is_training_bn,
-                    relu=True,
-                    init_zero=False,
-                    data_format='channels_last',
-                    name=None):
-  """Performs a batch normalization followed by a ReLU.
+def batch_norm_act(inputs,
+                   is_training_bn: bool,
+                   act_type: Union[Text, None],
+                   init_zero: bool = False,
+                   data_format: Text = 'channels_last',
+                   momentum: float = 0.99,
+                   epsilon: float = 1e-3,
+                   use_tpu: bool = False,
+                   name: Text = None):
+  """Performs a batch normalization followed by a non-linear activation.
 
   Args:
     inputs: `Tensor` of shape `[batch, channels, ...]`.
     is_training_bn: `bool` for whether the model is training.
-    relu: `bool` if False, omits the ReLU operation.
+    act_type: non-linear relu function type. If None, omits the relu operation.
     init_zero: `bool` if True, initializes scale parameter of batch
-        normalization with 0 instead of 1 (default).
+      normalization with 0 instead of 1 (default).
     data_format: `str` either "channels_first" for `[batch, channels, height,
-        width]` or "channels_last for `[batch, height, width, channels]`.
+      width]` or "channels_last for `[batch, height, width, channels]`.
+    momentum: `float`, momentume of batch norm.
+    epsilon: `float`, small value for numerical stability.
+    use_tpu: `bool`, whether to use tpu version of batch norm.
     name: the name of the batch normalization layer
 
   Returns:
@@ -227,16 +279,17 @@ def batch_norm_relu(inputs,
   inputs = tpu_batch_normalization(
       inputs=inputs,
       axis=axis,
-      momentum=_BATCH_NORM_DECAY,
-      epsilon=_BATCH_NORM_EPSILON,
+      momentum=momentum,
+      epsilon=epsilon,
       center=True,
       scale=True,
       training=is_training_bn,
+      use_tpu=use_tpu,
       gamma_initializer=gamma_initializer,
       name=name)
 
-  if relu:
-    inputs = relu_fn(inputs)
+  if act_type:
+    inputs = activation_fn(inputs, act_type)
   return inputs
 
 
@@ -266,8 +319,10 @@ def num_params_flops(readable_format=True):
   options['output'] = 'none'
   flops = tf.profiler.profile(
       tf.get_default_graph(), options=options).total_float_ops
+  # We use flops to denote multiply-adds, which is counted as 2 ops in tfprof.
+  flops = flops // 2
   if readable_format:
-    nparams = float(nparams)  * 1e-6
+    nparams = float(nparams) * 1e-6
     flops = float(flops) * 1e-9
   return nparams, flops
 
@@ -278,13 +333,12 @@ dense_kernel_initializer = tf.initializers.variance_scaling()
 
 def scalar(name, tensor):
   """Stores a (name, Tensor) tuple in a custom collection."""
-  tf.logging.info('Adding summary {}'.format((name, tensor)))
+  logging.info('Adding summary {}'.format((name, tensor)))
   tf.add_to_collection('edsummaries', (name, tf.reduce_mean(tensor)))
 
 
 def get_scalar_summaries():
   """Returns the list of (name, Tensor) summaries recorded by scalar()."""
-  tf.logging.info('get summaries {}'.format(tf.get_collection('edsummaries')))
   return tf.get_collection('edsummaries')
 
 
@@ -297,6 +351,7 @@ def get_tpu_host_call(global_step, params):
 
   model_dir = params['model_dir']
   iterations_per_loop = params.get('iterations_per_loop', 100)
+
   def host_call_fn(global_step, *args):
     """Training host call. Creates scalar summaries for training metrics."""
     gs = global_step[0]
@@ -324,13 +379,13 @@ def archive_ckpt(ckpt_eval, ckpt_objective, ckpt_path):
     with tf.io.gfile.GFile(saved_objective_path, 'r') as f:
       saved_objective = float(f.read())
   if saved_objective > ckpt_objective:
-    tf.logging.info('Ckpt {} is worse than {}'.format(
-        ckpt_objective, saved_objective))
+    logging.info('Ckpt {} is worse than {}'.format(ckpt_objective,
+                                                   saved_objective))
     return False
 
   filenames = tf.io.gfile.glob(ckpt_path + '.*')
   if filenames is None:
-    tf.logging.info('No files to copy for checkpoint {}'.format(ckpt_path))
+    logging.info('No files to copy for checkpoint {}'.format(ckpt_path))
     return False
 
   # clear up the backup folder.
@@ -341,7 +396,7 @@ def archive_ckpt(ckpt_eval, ckpt_objective, ckpt_path):
   # rename the old checkpoints to backup folder.
   dst_dir = os.path.join(ckpt_dir, 'archive')
   if tf.io.gfile.exists(dst_dir):
-    tf.logging.info('mv {} to {}'.format(dst_dir, backup_dir))
+    logging.info('mv {} to {}'.format(dst_dir, backup_dir))
     tf.io.gfile.rename(dst_dir, backup_dir)
 
   # Write checkpoints.
@@ -351,8 +406,7 @@ def archive_ckpt(ckpt_eval, ckpt_objective, ckpt_path):
     tf.io.gfile.copy(f, dest, overwrite=True)
   ckpt_state = tf.train.generate_checkpoint_state_proto(
       dst_dir,
-      model_checkpoint_path=ckpt_name,
-      all_model_checkpoint_paths=[ckpt_name])
+      model_checkpoint_path=os.path.join(dst_dir, ckpt_name))
   with tf.io.gfile.GFile(os.path.join(dst_dir, 'checkpoint'), 'w') as f:
     f.write(str(ckpt_state))
   with tf.io.gfile.GFile(os.path.join(dst_dir, 'best_eval.txt'), 'w') as f:
@@ -362,5 +416,17 @@ def archive_ckpt(ckpt_eval, ckpt_objective, ckpt_path):
   with tf.io.gfile.GFile(saved_objective_path, 'w') as f:
     f.write('%f' % ckpt_objective)
 
-  tf.logging.info('Copying checkpoint {} to {}'.format(ckpt_path, dst_dir))
+  logging.info('Copying checkpoint {} to {}'.format(ckpt_path, dst_dir))
   return True
+
+
+def get_feat_sizes(image_size: Union[int, Tuple[int, int]], max_level: int):
+  """Get feat widths and heights for all levels."""
+  if isinstance(image_size, int):
+    image_size = (image_size, image_size)
+  feat_sizes = [{'height': image_size[0], 'width': image_size[1]}]
+  feat_size = image_size
+  for _ in range(1, max_level + 1):
+    feat_size = ((feat_size[0] - 1) // 2 + 1, (feat_size[1] - 1) // 2 + 1)
+    feat_sizes.append({'height': feat_size[0], 'width': feat_size[1]})
+  return feat_sizes

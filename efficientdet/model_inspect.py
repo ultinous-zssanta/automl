@@ -23,12 +23,16 @@ import os
 import time
 
 from absl import flags
+from absl import logging
+
 import numpy as np
+from PIL import Image
 import tensorflow.compat.v1 as tf
 from typing import Text, Tuple, List
 
-import efficientdet_arch
-import retinanet_arch
+import det_model_fn
+import hparams_config
+import inference
 import utils
 
 
@@ -37,7 +41,10 @@ flags.DEFINE_string('logdir', '/tmp/deff/', 'log directory.')
 flags.DEFINE_string('runmode', 'dry', 'Run mode: {freeze, bm, dry}')
 flags.DEFINE_string('trace_filename', None, 'Trace file name.')
 flags.DEFINE_integer('num_classes', 90, 'Number of classes.')
-flags.DEFINE_integer('input_image_size', 640, 'Size of input image.')
+flags.DEFINE_string('input_image_size', None, 'Size of input image. Enter a'
+                    'single integer if the image height is equal to the width;'
+                    'Otherwise, enter two integers seprated by a "x".'
+                    'e.g. "1280x640" if width=1280 and height=640.')
 flags.DEFINE_integer('threads', 0, 'Number of threads.')
 flags.DEFINE_integer('bm_runs', 20, 'Number of benchmark runs.')
 flags.DEFINE_string('tensorrt', None, 'TensorRT mode: {None, FP32, FP16, INT8}')
@@ -48,6 +55,19 @@ flags.DEFINE_bool('xla', False, 'Run with xla optimization.')
 flags.DEFINE_string('ckpt_path', None, 'checkpoint dir used for eval.')
 flags.DEFINE_string('export_ckpt', None, 'Path for exporting new models.')
 flags.DEFINE_bool('enable_ema', True, 'Use ema variables for eval.')
+flags.DEFINE_string('data_format', None, 'data format, e.g., channel_last.')
+
+flags.DEFINE_string('input_image', None, 'Input image path for inference.')
+flags.DEFINE_string('output_image_dir', None, 'Output dir for inference.')
+
+# For visualization.
+flags.DEFINE_integer('line_thickness', None, 'Line thickness for box.')
+flags.DEFINE_integer('max_boxes_to_draw', None, 'Max number of boxes to draw.')
+flags.DEFINE_float('min_score_thresh', None, 'Score threshold to show box.')
+
+# For saved model.
+flags.DEFINE_string('saved_model_dir', '/tmp/saved_model',
+                    'Folder path for saved model.')
 
 FLAGS = flags.FLAGS
 
@@ -57,51 +77,129 @@ class ModelInspector(object):
 
   def __init__(self,
                model_name: Text,
-               image_size: int,
+               image_size: Text,
                num_classes: int,
                logdir: Text,
                tensorrt: Text = False,
                use_xla: bool = False,
                ckpt_path: Text = None,
                enable_ema: bool = True,
-               export_ckpt: Text = None):
+               export_ckpt: Text = None,
+               saved_model_dir: Text = None,
+               data_format: Text = None):
     self.model_name = model_name
-    self.image_size = image_size
+    self.model_params = hparams_config.get_detection_config(model_name)
     self.logdir = logdir
     self.tensorrt = tensorrt
     self.use_xla = use_xla
     self.ckpt_path = ckpt_path
     self.enable_ema = enable_ema
     self.export_ckpt = export_ckpt
+    self.saved_model_dir = saved_model_dir
+
+    if image_size is None:
+      image_size = hparams_config.get_detection_config(model_name).image_size
+      image_size = (image_size, image_size)
+    elif 'x' in image_size:
+      # image_size is in format of WIDTHxHEIGHT
+      width, height = image_size.split('x')
+      image_size = (int(height), int(width))
+    else:
+      # image_size is integer, witht the same width and height.
+      image_size = (int(image_size), int(image_size))
+
+    self.model_overrides = {
+        'image_size': image_size,
+        'num_classes': num_classes
+    }
+
+    if data_format:
+      self.model_overrides.update(dict(data_format=data_format))
 
     # A few fixed parameters.
-    batch_size = 1
+    self.batch_size = 1
     self.num_classes = num_classes
-    self.inputs_shape = [batch_size, image_size, image_size, 3]
-    self.labels_shape = [batch_size, self.num_classes]
+    self.data_format = data_format
+    self.inputs_shape = [self.batch_size, image_size[0], image_size[1], 3]
+    self.labels_shape = [self.batch_size, self.num_classes]
+    self.image_size = image_size
 
   def build_model(self, inputs: tf.Tensor,
-                  is_training: bool) -> List[tf.Tensor]:
+                  is_training: bool = False) -> List[tf.Tensor]:
     """Build model with inputs and labels and print out model stats."""
-    tf.logging.info('start building model')
-    if self.model_name.startswith('efficientdet'):
-      cls_outputs, box_outputs = efficientdet_arch.efficientdet(
-          inputs,
-          model_name=self.model_name,
-          is_training_bn=is_training,
-          use_bfloat16=False)
-    elif self.model_name.startswith('retinanet'):
-      cls_outputs, box_outputs = retinanet_arch.retinanet(
-          inputs,
-          model_name=self.model_name,
-          is_training_bn=is_training,
-          use_bfloat16=False)
+    logging.info('start building model')
+    model_arch = det_model_fn.get_model_arch(self.model_name)
+    cls_outputs, box_outputs = model_arch(
+        inputs,
+        model_name=self.model_name,
+        is_training_bn=is_training,
+        use_bfloat16=False,
+        **self.model_overrides)
 
     print('backbone+fpn+box params/flops = {:.6f}M, {:.9f}B'.format(
         *utils.num_params_flops()))
 
+    # Write to tfevent for tensorboard.
+    train_writer = tf.summary.FileWriter(self.logdir)
+    train_writer.add_graph(tf.get_default_graph())
+    train_writer.flush()
+
     all_outputs = list(cls_outputs.values()) + list(box_outputs.values())
     return all_outputs
+
+  def export_saved_model(self, **kwargs):
+    """Export a saved model for inference."""
+    tf.enable_resource_variables()
+    driver = inference.ServingDriver(
+        self.model_name,
+        self.ckpt_path,
+        enable_ema=self.enable_ema,
+        use_xla=self.use_xla,
+        data_format=self.data_format,
+        **kwargs)
+    driver.build(params_override=self.model_overrides)
+    driver.export(self.saved_model_dir)
+
+  def saved_model_inference(self, image_path_pattern, output_dir, **kwargs):
+    """Perform inference for the given saved model."""
+    driver = inference.ServingDriver(
+        self.model_name,
+        self.ckpt_path,
+        enable_ema=self.enable_ema,
+        use_xla=self.use_xla,
+        data_format=self.data_format,
+        **kwargs)
+    driver.load(self.saved_model_dir)
+    raw_images = []
+    image = Image.open(image_path_pattern)
+    raw_images.append(np.array(image))
+    detections_bs = driver.serve_images(raw_images)
+    for i, detections in enumerate(detections_bs):
+      img = driver.visualize(raw_images[i], detections, **kwargs)
+      output_image_path = os.path.join(output_dir, str(i) + '.jpg')
+      Image.fromarray(img).save(output_image_path)
+      logging.info('writing file to %s', output_image_path)
+
+  def saved_model_benchmark(self, image_path_pattern, **kwargs):
+    """Perform inference for the given saved model."""
+    driver = inference.ServingDriver(
+        self.model_name,
+        self.ckpt_path,
+        enable_ema=self.enable_ema,
+        use_xla=self.use_xla,
+        data_format=self.data_format,
+        **kwargs)
+    driver.load(self.saved_model_dir)
+    raw_images = []
+    image = Image.open(image_path_pattern)
+    raw_images.append(np.array(image))
+    driver.benchmark(raw_images, FLAGS.trace_filename)
+
+  def inference_single_image(self, image_image_path, output_dir, **kwargs):
+    driver = inference.InferenceDriver(self.model_name, self.ckpt_path,
+                                       self.image_size, self.num_classes,
+                                       self.enable_ema, self.data_format)
+    driver.inference(image_image_path, output_dir, **kwargs)
 
   def build_and_save_model(self):
     """build and save the model into self.logdir."""
@@ -165,7 +263,7 @@ class ModelInspector(object):
       outputs = self.build_model(inputs, is_training=False)
 
       checkpoint = tf.train.latest_checkpoint(self.logdir)
-      tf.logging.info('Loading checkpoint: {}'.format(checkpoint))
+      logging.info('Loading checkpoint: %s', checkpoint)
       saver = tf.train.Saver()
 
       # Restore the Variables from the checkpoint and freeze the Graph.
@@ -227,7 +325,7 @@ class ModelInspector(object):
           run_metadata = tf.RunMetadata()
           sess.run(output, feed_dict={inputs: img},
                    options=run_options, run_metadata=run_metadata)
-          tf.logging.info('Dumping trace to %s' % trace_filename)
+          logging.info('Dumping trace to %s', trace_filename)
           trace_dir = os.path.dirname(trace_filename)
           if not tf.io.gfile.exists(trace_dir):
             tf.io.gfile.makedirs(trace_dir)
@@ -246,6 +344,8 @@ class ModelInspector(object):
       print('{} {}runs {}threads: mean {:.4f} std {:.4f} min {:.4f} max {:.4f}'
             .format(self.model_name, len(timev), num_threads, np.mean(timev),
                     np.std(timev), np.min(timev), np.max(timev)))
+      print('Images per second FPS = {:.1f}'.format(
+          self.batch_size / float(np.mean(timev))))
 
   def convert_tr(self, graph_def, fetches):
     """Convert to TensorRT."""
@@ -267,6 +367,25 @@ class ModelInspector(object):
       self.freeze_model()
     elif runmode == 'ckpt':
       self.eval_ckpt()
+    elif runmode == 'saved_model_benchmark':
+      self.saved_model_benchmark(FLAGS.input_image)
+    elif runmode in ('infer', 'saved_model', 'saved_model_infer'):
+      config_dict = {}
+      if FLAGS.line_thickness:
+        config_dict['line_thickness'] = FLAGS.line_thickness
+      if FLAGS.max_boxes_to_draw:
+        config_dict['max_boxes_to_draw'] = FLAGS.max_boxes_to_draw
+      if FLAGS.min_score_thresh:
+        config_dict['min_score_thresh'] = FLAGS.min_score_thresh
+
+      if runmode == 'infer':
+        self.inference_single_image(
+            FLAGS.input_image, FLAGS.output_image_dir, **config_dict)
+      elif runmode == 'saved_model':
+        self.export_saved_model(**config_dict)
+      elif runmode == 'saved_model_infer':
+        self.saved_model_inference(
+            FLAGS.input_image, FLAGS.output_image_dir, **config_dict)
     elif runmode == 'bm':
       self.benchmark_model(warmup_runs=5, bm_runs=FLAGS.bm_runs,
                            num_threads=threads,
@@ -275,7 +394,7 @@ class ModelInspector(object):
 
 def main(_):
   if tf.io.gfile.exists(FLAGS.logdir) and FLAGS.delete_logdir:
-    tf.logging.info('Deleting log dir ...')
+    logging.info('Deleting log dir ...')
     tf.io.gfile.rmtree(FLAGS.logdir)
 
   inspector = ModelInspector(
@@ -287,9 +406,13 @@ def main(_):
       use_xla=FLAGS.xla,
       ckpt_path=FLAGS.ckpt_path,
       enable_ema=FLAGS.enable_ema,
-      export_ckpt=FLAGS.export_ckpt)
+      export_ckpt=FLAGS.export_ckpt,
+      saved_model_dir=FLAGS.saved_model_dir,
+      data_format=FLAGS.data_format)
   inspector.run_model(FLAGS.runmode, FLAGS.threads)
 
 
 if __name__ == '__main__':
+  logging.set_verbosity(logging.WARNING)
+  tf.disable_v2_behavior()
   tf.app.run(main)

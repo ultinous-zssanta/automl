@@ -12,5 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-# Object detection data loaders and libraries are mostly based on RetinaNet:
-# https://github.com/tensorflow/tpu/tree/master/models/official/retinanet
+"""Backbone network factory."""
+
+from backbone import efficientnet_builder
+from backbone import efficientnet_lite_builder
+
+
+def get_model_builder(model_name):
+  """Get the model_builder module for a given model name."""
+  if model_name.startswith('efficientnet-lite'):
+    return efficientnet_lite_builder
+  elif model_name.startswith('efficientnet-b'):
+    return efficientnet_builder
+  else:
+    raise ValueError('Unknown model name {}'.format(model_name))
