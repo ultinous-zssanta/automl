@@ -13,11 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for efficientnet_model."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+from absl import logging
 import tensorflow.compat.v1 as tf
 
 import utils
@@ -35,7 +31,7 @@ class ModelTest(tf.test.TestCase):
         0,
         'channels_last',
         num_classes=10,
-        batch_norm=utils.TpuBatchNormalization)
+        batch_norm=utils.batch_norm_class(False))
     blocks_args = [
         efficientnet_model.BlockArgs(
             kernel_size=3,
@@ -51,7 +47,7 @@ class ModelTest(tf.test.TestCase):
     ]
     model = efficientnet_model.Model(blocks_args, global_params)
     outputs = model(images, training=True)
-    self.assertEqual((10, 10), outputs.shape)
+    self.assertEqual((10, 10), outputs[0].shape)
 
   def test_fused_bottleneck_block(self):
     """Test for creating a model with fused bottleneck block arguments."""
@@ -78,7 +74,7 @@ class ModelTest(tf.test.TestCase):
     ]
     model = efficientnet_model.Model(blocks_args, global_params)
     outputs = model(images, training=True)
-    self.assertEqual((10, 10), outputs.shape)
+    self.assertEqual((10, 10), outputs[0].shape)
 
   def test_bottleneck_block_with_superpixel_layer(self):
     """Test for creating a model with fused bottleneck block arguments."""
@@ -105,7 +101,7 @@ class ModelTest(tf.test.TestCase):
     ]
     model = efficientnet_model.Model(blocks_args, global_params)
     outputs = model(images, training=True)
-    self.assertEqual((10, 10), outputs.shape)
+    self.assertEqual((10, 10), outputs[0].shape)
 
   def test_bottleneck_block_with_superpixel_tranformation(self):
     """Test for creating a model with fused bottleneck block arguments."""
@@ -132,7 +128,7 @@ class ModelTest(tf.test.TestCase):
     ]
     model = efficientnet_model.Model(blocks_args, global_params)
     outputs = model(images, training=True)
-    self.assertEqual((10, 10), outputs.shape)
+    self.assertEqual((10, 10), outputs[0].shape)
 
   def test_se_block(self):
     """Test for creating a model with SE block arguments."""
@@ -160,7 +156,7 @@ class ModelTest(tf.test.TestCase):
     ]
     model = efficientnet_model.Model(blocks_args, global_params)
     outputs = model(images, training=True)
-    self.assertEqual((10, 10), outputs.shape)
+    self.assertEqual((10, 10), outputs[0].shape)
 
   def test_variables(self):
     """Test for variables in blocks to be included in `model.variables`."""
@@ -189,7 +185,7 @@ class ModelTest(tf.test.TestCase):
     model = efficientnet_model.Model(blocks_args, global_params)
     _ = model(images, training=True)
     var_names = {var.name for var in model.variables}
-    self.assertIn('blocks_0/conv2d/kernel:0', var_names)
+    self.assertIn('model/blocks_0/conv2d/kernel:0', var_names)
 
   def test_reduction_endpoint_with_single_block_with_sp(self):
     """Test reduction point with single block/layer."""
@@ -252,5 +248,5 @@ class ModelTest(tf.test.TestCase):
     self.assertNotIn('reduction_2', model.endpoints)
 
 if __name__ == '__main__':
-  tf.disable_v2_behavior()
+  logging.set_verbosity(logging.WARNING)
   tf.test.main()

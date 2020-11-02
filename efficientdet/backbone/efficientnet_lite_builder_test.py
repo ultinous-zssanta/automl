@@ -13,11 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for efficientnet_lite_builder."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+from absl import logging
 import numpy as np
 import tensorflow.compat.v1 as tf
 
@@ -38,7 +34,7 @@ class EfficientnetBuilderTest(tf.test.TestCase):
         images,
         model_name=model_name,
         override_params=override_params,
-        training=True,
+        training=False,
         features_only=features_only,
         pooled_features_only=pooled_features_only)
     num_params = np.sum([np.prod(v.shape) for v in tf.trainable_variables()])
@@ -67,5 +63,7 @@ class EfficientnetBuilderTest(tf.test.TestCase):
 
 
 if __name__ == '__main__':
-  tf.disable_v2_behavior()
+  logging.set_verbosity(logging.WARNING)
+  # Disable eager to allow tf.profile works for #params/#flops.
+  tf.disable_eager_execution()
   tf.test.main()

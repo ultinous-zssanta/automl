@@ -13,34 +13,33 @@
 # limitations under the License.
 # ==============================================================================
 """Model function definition, including both architecture and loss."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
+import functools
 import re
 from absl import logging
 import numpy as np
 import tensorflow.compat.v1 as tf
-
-import anchors
 import coco_metric
 import efficientdet_arch
 import hparams_config
-import retinanet_arch
+import iou_utils
+import nms_np
 import utils
+from keras import anchors
+from keras import efficientdet_keras
+from keras import postprocess
 
 _DEFAULT_BATCH_SIZE = 64
 
 
 def update_learning_rate_schedule_parameters(params):
   """Updates params that are related to the learning rate schedule."""
-  # params['batch_size'] is per-shard within model_fn if use_tpu=true.
-  batch_size = (params['batch_size'] * params['num_shards'] if params['use_tpu']
-                else params['batch_size'])
+  # params['batch_size'] is per-shard within model_fn if strategy=tpu.
+  batch_size = (
+      params['batch_size'] * params['num_shards']
+      if params['strategy'] in ['tpu', 'gpus'] else params['batch_size'])
   # Learning rate is proportional to the batch size
-  params['adjusted_learning_rate'] = (params['learning_rate'] * batch_size /
-                                      _DEFAULT_BATCH_SIZE)
+  params['adjusted_learning_rate'] = (
+      params['learning_rate'] * batch_size / _DEFAULT_BATCH_SIZE)
   steps_per_epoch = params['num_examples_per_epoch'] / batch_size
   params['lr_warmup_step'] = int(params['lr_warmup_epoch'] * steps_per_epoch)
   params['first_lr_drop_step'] = int(params['first_lr_drop_epoch'] *
@@ -48,22 +47,22 @@ def update_learning_rate_schedule_parameters(params):
   params['second_lr_drop_step'] = int(params['second_lr_drop_epoch'] *
                                       steps_per_epoch)
   params['total_steps'] = int(params['num_epochs'] * steps_per_epoch)
+  params['steps_per_epoch'] = steps_per_epoch
 
 
-def stepwise_lr_schedule(adjusted_learning_rate, lr_warmup_init,
-                         lr_warmup_step, first_lr_drop_step,
-                         second_lr_drop_step, global_step):
+def stepwise_lr_schedule(adjusted_learning_rate, lr_warmup_init, lr_warmup_step,
+                         first_lr_drop_step, second_lr_drop_step, global_step):
   """Handles linear scaling rule, gradual warmup, and LR decay."""
   # lr_warmup_init is the starting learning rate; the learning rate is linearly
   # scaled up to the full learning rate after `lr_warmup_step` before decaying.
   logging.info('LR schedule method: stepwise')
-  linear_warmup = (lr_warmup_init +
-                   (tf.cast(global_step, dtype=tf.float32) / lr_warmup_step *
-                    (adjusted_learning_rate - lr_warmup_init)))
-  learning_rate = tf.where(global_step < lr_warmup_step,
-                           linear_warmup, adjusted_learning_rate)
-  lr_schedule = [[1.0, lr_warmup_step],
-                 [0.1, first_lr_drop_step],
+  linear_warmup = (
+      lr_warmup_init +
+      (tf.cast(global_step, dtype=tf.float32) / lr_warmup_step *
+       (adjusted_learning_rate - lr_warmup_init)))
+  learning_rate = tf.where(global_step < lr_warmup_step, linear_warmup,
+                           adjusted_learning_rate)
+  lr_schedule = [[1.0, lr_warmup_step], [0.1, first_lr_drop_step],
                  [0.01, second_lr_drop_step]]
   for mult, start_global_step in lr_schedule:
     learning_rate = tf.where(global_step < start_global_step, learning_rate,
@@ -71,34 +70,16 @@ def stepwise_lr_schedule(adjusted_learning_rate, lr_warmup_init,
   return learning_rate
 
 
-def cosine_lr_schedule_tf2(adjusted_lr, lr_warmup_init, lr_warmup_step,
-                           total_steps, step):
-  """TF2 friendly cosine learning rate schedule."""
-  logging.info('LR schedule method: cosine')
-  def warmup_lr(step):
-    return lr_warmup_init + (adjusted_lr - lr_warmup_init) * (
-        tf.cast(step, tf.float32) / tf.cast(lr_warmup_step, tf.float32))
-  def cosine_lr(step):
-    decay_steps = tf.cast(total_steps - lr_warmup_step, tf.float32)
-    step = tf.cast(step - lr_warmup_step, tf.float32)
-    cosine_decay = 0.5 * (1 + tf.cos(np.pi * step / decay_steps))
-    alpha = 0.0
-    decayed = (1 - alpha) * cosine_decay + alpha
-    return adjusted_lr * tf.cast(decayed, tf.float32)
-  return tf.cond(step <= lr_warmup_step,
-                 lambda: warmup_lr(step),
-                 lambda: cosine_lr(step))
-
-
-def cosine_lr_schedule(adjusted_lr, lr_warmup_init, lr_warmup_step,
-                       total_steps, step):
+def cosine_lr_schedule(adjusted_lr, lr_warmup_init, lr_warmup_step, total_steps,
+                       step):
+  """Cosine learning rate scahedule."""
   logging.info('LR schedule method: cosine')
   linear_warmup = (
-      lr_warmup_init +
-      (tf.cast(step, dtype=tf.float32) / lr_warmup_step *
-       (adjusted_lr - lr_warmup_init)))
+      lr_warmup_init + (tf.cast(step, dtype=tf.float32) / lr_warmup_step *
+                        (adjusted_lr - lr_warmup_init)))
+  decay_steps = tf.cast(total_steps - lr_warmup_step, tf.float32)
   cosine_lr = 0.5 * adjusted_lr * (
-      1 + tf.cos(np.pi * tf.cast(step, tf.float32) / total_steps))
+      1 + tf.cos(np.pi * tf.cast(step, tf.float32) / decay_steps))
   return tf.where(step < lr_warmup_step, linear_warmup, cosine_lr)
 
 
@@ -126,8 +107,8 @@ def learning_rate_schedule(params, global_step):
   if lr_decay_method == 'cosine':
     return cosine_lr_schedule(params['adjusted_learning_rate'],
                               params['lr_warmup_init'],
-                              params['lr_warmup_step'],
-                              params['total_steps'], global_step)
+                              params['lr_warmup_step'], params['total_steps'],
+                              global_step)
 
   if lr_decay_method == 'polynomial':
     return polynomial_lr_schedule(params['adjusted_learning_rate'],
@@ -136,80 +117,49 @@ def learning_rate_schedule(params, global_step):
                                   params['poly_lr_power'],
                                   params['total_steps'], global_step)
 
+  if lr_decay_method == 'constant':
+    return params['adjusted_learning_rate']
+
   raise ValueError('unknown lr_decay_method: {}'.format(lr_decay_method))
 
 
-def focal_loss(logits, targets, alpha, gamma, normalizer):
+def focal_loss(y_pred, y_true, alpha, gamma, normalizer, label_smoothing=0.0):
   """Compute the focal loss between `logits` and the golden `target` values.
 
   Focal loss = -(1-pt)^gamma * log(pt)
   where pt is the probability of being classified to the true class.
 
   Args:
-    logits: A float32 tensor of size
-      [batch, height_in, width_in, num_predictions].
-    targets: A float32 tensor of size
-      [batch, height_in, width_in, num_predictions].
-    alpha: A float32 scalar multiplying alpha to the loss from positive examples
+    y_pred: A float tensor of size [batch, height_in, width_in,
+      num_predictions].
+    y_true: A float tensor of size [batch, height_in, width_in,
+      num_predictions].
+    alpha: A float scalar multiplying alpha to the loss from positive examples
       and (1-alpha) to the loss from negative examples.
-    gamma: A float32 scalar modulating loss from hard and easy examples.
-    normalizer: A float32 scalar normalizes the total loss from all examples.
+    gamma: A float scalar modulating loss from hard and easy examples.
+    normalizer: Divide loss by this value.
+    label_smoothing: Float in [0, 1]. If > `0` then smooth the labels.
+
   Returns:
     loss: A float32 scalar representing normalized total loss.
   """
   with tf.name_scope('focal_loss'):
-    positive_label_mask = tf.equal(targets, 1.0)
-    cross_entropy = (
-        tf.nn.sigmoid_cross_entropy_with_logits(labels=targets, logits=logits))
-    # Below are comments/derivations for computing modulator.
-    # For brevity, let x = logits,  z = targets, r = gamma, and p_t = sigmod(x)
-    # for positive samples and 1 - sigmoid(x) for negative examples.
-    #
-    # The modulator, defined as (1 - P_t)^r, is a critical part in focal loss
-    # computation. For r > 0, it puts more weights on hard examples, and less
-    # weights on easier ones. However if it is directly computed as (1 - P_t)^r,
-    # its back-propagation is not stable when r < 1. The implementation here
-    # resolves the issue.
-    #
-    # For positive samples (labels being 1),
-    #    (1 - p_t)^r
-    #  = (1 - sigmoid(x))^r
-    #  = (1 - (1 / (1 + exp(-x))))^r
-    #  = (exp(-x) / (1 + exp(-x)))^r
-    #  = exp(log((exp(-x) / (1 + exp(-x)))^r))
-    #  = exp(r * log(exp(-x)) - r * log(1 + exp(-x)))
-    #  = exp(- r * x - r * log(1 + exp(-x)))
-    #
-    # For negative samples (labels being 0),
-    #    (1 - p_t)^r
-    #  = (sigmoid(x))^r
-    #  = (1 / (1 + exp(-x)))^r
-    #  = exp(log((1 / (1 + exp(-x)))^r))
-    #  = exp(-r * log(1 + exp(-x)))
-    #
-    # Therefore one unified form for positive (z = 1) and negative (z = 0)
-    # samples is:
-    #      (1 - p_t)^r = exp(-r * z * x - r * log(1 + exp(-x))).
-    neg_logits = -1.0 * logits
-    modulator = tf.exp(gamma * targets * neg_logits - gamma * tf.log1p(
-        tf.exp(neg_logits)))
-    loss = modulator * cross_entropy
-    weighted_loss = tf.where(positive_label_mask, alpha * loss,
-                             (1.0 - alpha) * loss)
-    weighted_loss /= normalizer
-  return weighted_loss
+    normalizer = tf.cast(normalizer, dtype=y_pred.dtype)
 
+    # compute focal loss multipliers before label smoothing, such that it will
+    # not blow up the loss.
+    pred_prob = tf.sigmoid(y_pred)
+    p_t = (y_true * pred_prob) + ((1 - y_true) * (1 - pred_prob))
+    alpha_factor = y_true * alpha + (1 - y_true) * (1 - alpha)
+    modulating_factor = (1.0 - p_t)**gamma
 
-def _classification_loss(cls_outputs,
-                         cls_targets,
-                         num_positives,
-                         alpha=0.25,
-                         gamma=2.0):
-  """Computes classification loss."""
-  normalizer = num_positives
-  classification_loss = focal_loss(cls_outputs, cls_targets, alpha, gamma,
-                                   normalizer)
-  return classification_loss
+    # apply label smoothing for cross_entropy for each entry.
+    if label_smoothing:
+      y_true = y_true * (1.0 - label_smoothing) + 0.5 * label_smoothing
+    ce = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
+
+    # compute the final loss and return
+    return (1 / normalizer) * alpha_factor * modulating_factor * ce
 
 
 def _box_loss(box_outputs, box_targets, num_positives, delta=0.1):
@@ -229,6 +179,14 @@ def _box_loss(box_outputs, box_targets, num_positives, delta=0.1):
   return box_loss
 
 
+def _box_iou_loss(box_outputs, box_targets, num_positives, iou_loss_type):
+  """Computes box iou loss."""
+  normalizer = num_positives * 4.0
+  box_iou_loss = iou_utils.iou_loss(box_outputs, box_targets, iou_loss_type)
+  box_iou_loss = tf.reduce_sum(box_iou_loss) / normalizer
+  return box_iou_loss
+
+
 def detection_loss(cls_outputs, box_outputs, labels, params):
   """Computes total detection loss.
 
@@ -237,35 +195,50 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
     cls_outputs: an OrderDict with keys representing levels and values
       representing logits in [batch_size, height, width, num_anchors].
     box_outputs: an OrderDict with keys representing levels and values
-      representing box regression targets in
-      [batch_size, height, width, num_anchors * 4].
+      representing box regression targets in [batch_size, height, width,
+      num_anchors * 4].
     labels: the dictionary that returned from dataloader that includes
       groundtruth targets.
     params: the dictionary including training parameters specified in
       default_haprams function in this file.
+
   Returns:
     total_loss: an integer tensor representing total loss reducing from
       class and box losses from all levels.
     cls_loss: an integer tensor representing total class loss.
     box_loss: an integer tensor representing total box regression loss.
+    box_iou_loss: an integer tensor representing total box iou loss.
   """
   # Sum all positives in a batch for normalization and avoid zero
   # num_positives_sum, which would lead to inf loss during training
   num_positives_sum = tf.reduce_sum(labels['mean_num_positives']) + 1.0
-  levels = cls_outputs.keys()
+  positives_momentum = params.get('positives_momentum', None) or 0
+  if positives_momentum > 0:
+    # normalize the num_positive_examples for training stability.
+    moving_normalizer_var = tf.Variable(
+        0.0,
+        name='moving_normalizer',
+        dtype=tf.float32,
+        synchronization=tf.VariableSynchronization.ON_READ,
+        trainable=False,
+        aggregation=tf.VariableAggregation.MEAN)
+    num_positives_sum = tf.keras.backend.moving_average_update(
+        moving_normalizer_var,
+        num_positives_sum,
+        momentum=params['positives_momentum'])
+  elif positives_momentum < 0:
+    num_positives_sum = utils.cross_replica_mean(num_positives_sum)
 
+  levels = cls_outputs.keys()
   cls_losses = []
   box_losses = []
   for level in levels:
-    if params['data_format'] == 'channels_first':
-      labels['cls_targets_%d' % level] = tf.transpose(
-          labels['cls_targets_%d' % level], [0, 3, 1, 2])
-      labels['box_targets_%d' % level] = tf.transpose(
-          labels['box_targets_%d' % level], [0, 3, 1, 2])
     # Onehot encoding for classification labels.
     cls_targets_at_level = tf.one_hot(
         labels['cls_targets_%d' % level],
-        params['num_classes'])
+        params['num_classes'],
+        dtype=cls_outputs[level].dtype)
+
     if params['data_format'] == 'channels_first':
       bs, _, width, height, _ = cls_targets_at_level.get_shape().as_list()
       cls_targets_at_level = tf.reshape(cls_targets_at_level,
@@ -275,144 +248,80 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
       cls_targets_at_level = tf.reshape(cls_targets_at_level,
                                         [bs, width, height, -1])
     box_targets_at_level = labels['box_targets_%d' % level]
-    cls_loss = _classification_loss(
+
+    cls_loss = focal_loss(
         cls_outputs[level],
         cls_targets_at_level,
-        num_positives_sum,
-        alpha=params['alpha'],
-        gamma=params['gamma'])
+        params['alpha'],
+        params['gamma'],
+        normalizer=num_positives_sum,
+        label_smoothing=params['label_smoothing'])
+
     if params['data_format'] == 'channels_first':
       cls_loss = tf.reshape(cls_loss,
                             [bs, -1, width, height, params['num_classes']])
     else:
       cls_loss = tf.reshape(cls_loss,
                             [bs, width, height, -1, params['num_classes']])
-    cls_loss *= tf.cast(tf.expand_dims(
-        tf.not_equal(labels['cls_targets_%d' % level], -2), -1), tf.float32)
-    cls_losses.append(tf.reduce_sum(cls_loss))
-    box_losses.append(
-        _box_loss(
-            box_outputs[level],
-            box_targets_at_level,
-            num_positives_sum,
-            delta=params['delta']))
+
+    cls_loss *= tf.cast(
+        tf.expand_dims(tf.not_equal(labels['cls_targets_%d' % level], -2), -1),
+        cls_loss.dtype)
+    cls_loss_sum = tf.clip_by_value(tf.reduce_sum(cls_loss), 0.0, 2.0)
+    cls_losses.append(tf.cast(cls_loss_sum, tf.float32))
+
+    if params['box_loss_weight']:
+      box_losses.append(
+          _box_loss(
+              box_outputs[level],
+              box_targets_at_level,
+              num_positives_sum,
+              delta=params['delta']))
+
+  if params['iou_loss_type']:
+    input_anchors = anchors.Anchors(params['min_level'], params['max_level'],
+                                    params['num_scales'],
+                                    params['aspect_ratios'],
+                                    params['anchor_scale'],
+                                    params['image_size'])
+    box_output_list = [tf.reshape(box_outputs[i], [-1, 4]) for i in levels]
+    box_outputs = tf.concat(box_output_list, axis=0)
+    box_target_list = [
+        tf.reshape(labels['box_targets_%d' % level], [-1, 4])
+        for level in levels
+    ]
+    box_targets = tf.concat(box_target_list, axis=0)
+    anchor_boxes = tf.tile(input_anchors.boxes, [params['batch_size'], 1])
+    box_outputs = anchors.decode_box_outputs(box_outputs, anchor_boxes)
+    box_targets = anchors.decode_box_outputs(box_targets, anchor_boxes)
+    box_iou_loss = _box_iou_loss(box_outputs, box_targets, num_positives_sum,
+                                 params['iou_loss_type'])
+
+  else:
+    box_iou_loss = 0
 
   # Sum per level losses to total loss.
   cls_loss = tf.add_n(cls_losses)
-  box_loss = tf.add_n(box_losses)
-  total_loss = cls_loss + params['box_loss_weight'] * box_loss
-  return total_loss, cls_loss, box_loss
+  box_loss = tf.add_n(box_losses) if box_losses else 0
 
+  total_loss = (
+      cls_loss + params['box_loss_weight'] * box_loss +
+      params['iou_loss_weight'] * box_iou_loss)
 
-def add_metric_fn_inputs(params,
-                         cls_outputs,
-                         box_outputs,
-                         metric_fn_inputs,
-                         max_detection_points=anchors.MAX_DETECTION_POINTS):
-  """Selects top-k predictions and adds the selected to metric_fn_inputs.
-
-  Args:
-    params: a parameter dictionary that includes `min_level`, `max_level`,
-      `batch_size`, and `num_classes`.
-    cls_outputs: an OrderDict with keys representing levels and values
-      representing logits in [batch_size, height, width, num_anchors].
-    box_outputs: an OrderDict with keys representing levels and values
-      representing box regression targets in
-      [batch_size, height, width, num_anchors * 4].
-    metric_fn_inputs: a dictionary that will hold the top-k selections.
-    max_detection_points: an integer specifing the maximum detection points to
-      keep before NMS. Keep all anchors if max_detection_points <= 0.
-  """
-  num_classes = params['num_classes']
-  cls_outputs_all = []
-  box_outputs_all = []
-  # Concatenates class and box of all levels into one tensor.
-  for level in range(params['min_level'], params['max_level'] + 1):
-    if params['data_format'] == 'channels_first':
-      cls_outputs[level] = tf.transpose(cls_outputs[level], [0, 2, 3, 1])
-      box_outputs[level] = tf.transpose(box_outputs[level], [0, 2, 3, 1])
-
-    cls_outputs_all.append(tf.reshape(
-        cls_outputs[level],
-        [params['batch_size'], -1, num_classes]))
-    box_outputs_all.append(tf.reshape(
-        box_outputs[level], [params['batch_size'], -1, 4]))
-  cls_outputs_all = tf.concat(cls_outputs_all, 1)
-  box_outputs_all = tf.concat(box_outputs_all, 1)
-
-  if max_detection_points > 0:
-    # Prune anchors and detections to only keep max_detection_points.
-    # Due to some issues, top_k is currently slow in graph model.
-    cls_outputs_all_reshape = tf.reshape(cls_outputs_all,
-                                         [params['batch_size'], -1])
-    _, cls_topk_indices = tf.math.top_k(cls_outputs_all_reshape,
-                                        k=anchors.MAX_DETECTION_POINTS,
-                                        sorted=False)
-    indices = cls_topk_indices // num_classes
-    classes = cls_topk_indices % num_classes
-    cls_indices = tf.stack([indices, classes], axis=2)
-    cls_outputs_all_after_topk = tf.gather_nd(
-        cls_outputs_all, cls_indices, batch_dims=1)
-    box_outputs_all_after_topk = tf.gather_nd(
-        box_outputs_all, tf.expand_dims(indices, 2), batch_dims=1)
-  else:
-    # Keep all anchors, but for each anchor, just keep the max probablity for
-    # each class.
-    cls_outputs_idx = tf.math.argmax(cls_outputs_all, axis=-1)
-    num_anchors = cls_outputs_all.shape[1]
-
-    classes = cls_outputs_idx
-    indices = tf.reshape(
-        tf.tile(tf.range(num_anchors), [params['batch_size']]),
-        [-1, num_anchors])
-    cls_outputs_all_after_topk = tf.reduce_max(cls_outputs_all, -1)
-    box_outputs_all_after_topk = box_outputs_all
-
-  metric_fn_inputs['cls_outputs_all'] = cls_outputs_all_after_topk
-  metric_fn_inputs['box_outputs_all'] = box_outputs_all_after_topk
-  metric_fn_inputs['indices_all'] = indices
-  metric_fn_inputs['classes_all'] = classes
-
-
-def coco_metric_fn(batch_size,
-                   anchor_labeler,
-                   filename=None,
-                   testdev_dir=None,
-                   **kwargs):
-  """Evaluation metric fn. Performed on CPU, do not reference TPU ops."""
-  # add metrics to output
-  detections_bs = []
-  for index in range(batch_size):
-    cls_outputs_per_sample = kwargs['cls_outputs_all'][index]
-    box_outputs_per_sample = kwargs['box_outputs_all'][index]
-    indices_per_sample = kwargs['indices_all'][index]
-    classes_per_sample = kwargs['classes_all'][index]
-    detections = anchor_labeler.generate_detections(
-        cls_outputs_per_sample, box_outputs_per_sample, indices_per_sample,
-        classes_per_sample, tf.slice(kwargs['source_ids'], [index], [1]),
-        tf.slice(kwargs['image_scales'], [index], [1]),
-        disable_pyfun=kwargs.get('disable_pyfun', None),
-    )
-    detections_bs.append(detections)
-
-  if testdev_dir:
-    eval_metric = coco_metric.EvaluationMetric(testdev_dir=testdev_dir)
-    coco_metrics = eval_metric.estimator_metric_fn(detections_bs, tf.zeros([1]))
-  else:
-    eval_metric = coco_metric.EvaluationMetric(filename=filename)
-    coco_metrics = eval_metric.estimator_metric_fn(detections_bs,
-                                                   kwargs['groundtruth_data'])
-  return coco_metrics
+  return total_loss, cls_loss, box_loss, box_iou_loss
 
 
 def reg_l2_loss(weight_decay, regex=r'.*(kernel|weight):0$'):
   """Return regularization l2 loss loss."""
   var_match = re.compile(regex)
-  return weight_decay * tf.add_n(
-      [tf.nn.l2_loss(v) for v in tf.trainable_variables()
-       if var_match.match(v.name)])
+  return weight_decay * tf.add_n([
+      tf.nn.l2_loss(v)
+      for v in tf.trainable_variables()
+      if var_match.match(v.name)
+  ])
 
 
+@tf.autograph.experimental.do_not_convert
 def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
   """Model definition entry.
 
@@ -422,7 +331,7 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     labels: the input labels in a dictionary. The labels include class targets
       and box targets which are dense label maps. The labels are generated from
       get_input_fn function in data/dataloader.py
-    mode: the mode of TPUEstimator including TRAIN, EVAL, and PREDICT.
+    mode: the mode of TPUEstimator including TRAIN and EVAL.
     params: the dictionary defines hyperparameters of model. The default
       settings are in default_hparams function in this file.
     model: the model outputs class logits and box regression outputs.
@@ -435,32 +344,34 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
   Raises:
     RuntimeError: if both ckpt and backbone_ckpt are set.
   """
-  # Convert params (dict) to Config for easier access.
-  if params['data_format'] == 'channels_first':
-    features = tf.transpose(features, [0, 3, 1, 2])
-  def _model_outputs():
-    return model(features, config=hparams_config.Config(params))
+  is_tpu = params['strategy'] == 'tpu'
+  if params['img_summary_steps']:
+    utils.image('input_image', features, is_tpu)
+  training_hooks = []
+  params['is_training_bn'] = (mode == tf.estimator.ModeKeys.TRAIN)
 
-  if params['use_bfloat16']:
-    with tf.tpu.bfloat16_scope():
-      cls_outputs, box_outputs = _model_outputs()
-      levels = cls_outputs.keys()
-      for level in levels:
-        cls_outputs[level] = tf.cast(cls_outputs[level], tf.float32)
-        box_outputs[level] = tf.cast(box_outputs[level], tf.float32)
+  if params['use_keras_model']:
+
+    def model_fn(inputs):
+      model = efficientdet_keras.EfficientDetNet(
+          config=hparams_config.Config(params))
+      cls_out_list, box_out_list = model(inputs, params['is_training_bn'])
+      cls_outputs, box_outputs = {}, {}
+      for i in range(params['min_level'], params['max_level'] + 1):
+        cls_outputs[i] = cls_out_list[i - params['min_level']]
+        box_outputs[i] = box_out_list[i - params['min_level']]
+      return cls_outputs, box_outputs
   else:
-    cls_outputs, box_outputs = _model_outputs()
-    levels = cls_outputs.keys()
+    model_fn = functools.partial(model, config=hparams_config.Config(params))
 
-  # First check if it is in PREDICT mode.
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    predictions = {
-        'image': features,
-    }
-    for level in levels:
-      predictions['cls_outputs_%d' % level] = cls_outputs[level]
-      predictions['box_outputs_%d' % level] = box_outputs[level]
-    return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+  precision = utils.get_precision(params['strategy'], params['mixed_precision'])
+  cls_outputs, box_outputs = utils.build_model_with_precision(
+      precision, model_fn, features, params['is_training_bn'])
+
+  levels = cls_outputs.keys()
+  for level in levels:
+    cls_outputs[level] = tf.cast(cls_outputs[level], tf.float32)
+    box_outputs[level] = tf.cast(box_outputs[level], tf.float32)
 
   # Set up training loss and learning rate.
   update_learning_rate_schedule_parameters(params)
@@ -468,18 +379,22 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
   learning_rate = learning_rate_schedule(params, global_step)
 
   # cls_loss and box_loss are for logging. only total_loss is optimized.
-  det_loss, cls_loss, box_loss = detection_loss(cls_outputs, box_outputs,
-                                                labels, params)
-  l2loss = reg_l2_loss(params['weight_decay'])
-  total_loss = det_loss + l2loss
+  det_loss, cls_loss, box_loss, box_iou_loss = detection_loss(
+      cls_outputs, box_outputs, labels, params)
+  reg_l2loss = reg_l2_loss(params['weight_decay'])
+  total_loss = det_loss + reg_l2loss
 
   if mode == tf.estimator.ModeKeys.TRAIN:
-    utils.scalar('lrn_rate', learning_rate)
-    utils.scalar('trainloss/cls_loss', cls_loss)
-    utils.scalar('trainloss/box_loss', box_loss)
-    utils.scalar('trainloss/det_loss', det_loss)
-    utils.scalar('trainloss/l2_loss', l2loss)
-    utils.scalar('trainloss/loss', total_loss)
+    utils.scalar('lrn_rate', learning_rate, is_tpu)
+    utils.scalar('trainloss/cls_loss', cls_loss, is_tpu)
+    utils.scalar('trainloss/box_loss', box_loss, is_tpu)
+    utils.scalar('trainloss/det_loss', det_loss, is_tpu)
+    utils.scalar('trainloss/reg_l2_loss', reg_l2loss, is_tpu)
+    utils.scalar('trainloss/loss', total_loss, is_tpu)
+    if params['iou_loss_type']:
+      utils.scalar('trainloss/box_iou_loss', box_iou_loss, is_tpu)
+    train_epochs = tf.cast(global_step, tf.float32) / params['steps_per_epoch']
+    utils.scalar('train_epochs', train_epochs, is_tpu)
 
   moving_average_decay = params['moving_average_decay']
   if moving_average_decay:
@@ -488,26 +403,55 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     ema_vars = utils.get_ema_vars()
 
   if mode == tf.estimator.ModeKeys.TRAIN:
-    optimizer = tf.train.MomentumOptimizer(
-        learning_rate, momentum=params['momentum'])
-    if params['use_tpu']:
+    if params['optimizer'].lower() == 'sgd':
+      optimizer = tf.train.MomentumOptimizer(
+          learning_rate, momentum=params['momentum'])
+    elif params['optimizer'].lower() == 'adam':
+      optimizer = tf.train.AdamOptimizer(learning_rate)
+    else:
+      raise ValueError('optimizers should be adam or sgd')
+
+    if is_tpu:
       optimizer = tf.tpu.CrossShardOptimizer(optimizer)
+    if params['device']['grad_ckpting']:
+      # pylint: disable=g-import-not-at-top,g-direct-tensorflow-import
+      from third_party.grad_checkpoint import grad
+      from tensorflow.python.ops import gradients
+      # pylint: enable=g-import-not-at-top,g-direct-tensorflow-import
+
+      # monkey patch tf.gradients to point to our custom version,
+      # with automatic checkpoint selection
+      def gradients_(ys, xs, grad_ys=None, **kwargs):
+        return grad.gradients(
+            ys,
+            xs,
+            grad_ys,
+            checkpoints=params['device']['grad_ckpting_list'],
+            **kwargs)
+
+      gradients.__dict__['gradients'] = gradients_
 
     # Batch norm requires update_ops to be added as a train_op dependency.
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     var_list = tf.trainable_variables()
     if variable_filter_fn:
-      var_list = variable_filter_fn(var_list, params['resnet_depth'])
+      var_list = variable_filter_fn(var_list)
 
-    if params.get('clip_gradients_norm', 0) > 0:
+    if params.get('clip_gradients_norm', None):
       logging.info('clip gradients norm by %f', params['clip_gradients_norm'])
       grads_and_vars = optimizer.compute_gradients(total_loss, var_list)
       with tf.name_scope('clip'):
         grads = [gv[0] for gv in grads_and_vars]
         tvars = [gv[1] for gv in grads_and_vars]
-        clipped_grads, gnorm = tf.clip_by_global_norm(
-            grads, params['clip_gradients_norm'])
-        utils.scalar('gnorm', gnorm)
+        # First clip each variable's norm, then clip global norm.
+        clip_norm = abs(params['clip_gradients_norm'])
+        clipped_grads = [
+            tf.clip_by_norm(g, clip_norm) if g is not None else None
+            for g in grads
+        ]
+        clipped_grads, _ = tf.clip_by_global_norm(clipped_grads, clip_norm)
+        utils.scalar('gradient_norm', tf.linalg.global_norm(clipped_grads),
+                     is_tpu)
         grads_and_vars = list(zip(clipped_grads, tvars))
 
       with tf.control_dependencies(update_ops):
@@ -526,35 +470,62 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
 
   eval_metrics = None
   if mode == tf.estimator.ModeKeys.EVAL:
+
     def metric_fn(**kwargs):
       """Returns a dictionary that has the evaluation metrics."""
-      batch_size = params['batch_size']
-      eval_anchors = anchors.Anchors(params['min_level'],
-                                     params['max_level'],
-                                     params['num_scales'],
-                                     params['aspect_ratios'],
-                                     params['anchor_scale'],
-                                     params['image_size'])
-      anchor_labeler = anchors.AnchorLabeler(eval_anchors,
-                                             params['num_classes'])
-      cls_loss = tf.metrics.mean(kwargs['cls_loss_repeat'])
-      box_loss = tf.metrics.mean(kwargs['box_loss_repeat'])
+      if params['nms_configs'].get('pyfunc', True):
+        detections_bs = []
+        for index in range(kwargs['boxes'].shape[0]):
+          nms_configs = params['nms_configs']
+          detections = tf.numpy_function(
+              functools.partial(nms_np.per_class_nms, nms_configs=nms_configs),
+              [
+                  kwargs['boxes'][index],
+                  kwargs['scores'][index],
+                  kwargs['classes'][index],
+                  tf.slice(kwargs['image_ids'], [index], [1]),
+                  tf.slice(kwargs['image_scales'], [index], [1]),
+                  params['num_classes'],
+                  nms_configs['max_output_size'],
+              ], tf.float32)
+          detections_bs.append(detections)
+        detections_bs = postprocess.transform_detections(
+            tf.stack(detections_bs))
+      else:
+        # These two branches should be equivalent, but currently they are not.
+        # TODO(tanmingxing): enable the non_pyfun path after bug fix.
+        nms_boxes, nms_scores, nms_classes, _ = postprocess.per_class_nms(
+            params, kwargs['boxes'], kwargs['scores'], kwargs['classes'],
+            kwargs['image_scales'])
+        img_ids = tf.cast(
+            tf.expand_dims(kwargs['image_ids'], -1), nms_scores.dtype)
+        detections_bs = [
+            img_ids * tf.ones_like(nms_scores),
+            nms_boxes[:, :, 1],
+            nms_boxes[:, :, 0],
+            nms_boxes[:, :, 3] - nms_boxes[:, :, 1],
+            nms_boxes[:, :, 2] - nms_boxes[:, :, 0],
+            nms_scores,
+            nms_classes,
+        ]
+        detections_bs = tf.stack(detections_bs, axis=-1, name='detnections')
 
       if params.get('testdev_dir', None):
         logging.info('Eval testdev_dir %s', params['testdev_dir'])
-        coco_metrics = coco_metric_fn(
-            batch_size,
-            anchor_labeler,
-            params['val_json_file'],
-            testdev_dir=params['testdev_dir'],
-            disable_pyfun=params.get('disable_pyfun', None),
-            **kwargs)
+        eval_metric = coco_metric.EvaluationMetric(
+            testdev_dir=params['testdev_dir'])
+        coco_metrics = eval_metric.estimator_metric_fn(detections_bs,
+                                                       tf.zeros([1]))
       else:
         logging.info('Eval val with groudtruths %s.', params['val_json_file'])
-        coco_metrics = coco_metric_fn(batch_size, anchor_labeler,
-                                      params['val_json_file'], **kwargs)
+        eval_metric = coco_metric.EvaluationMetric(
+            filename=params['val_json_file'], label_map=params['label_map'])
+        coco_metrics = eval_metric.estimator_metric_fn(
+            detections_bs, kwargs['groundtruth_data'])
 
       # Add metrics to output.
+      cls_loss = tf.metrics.mean(kwargs['cls_loss_repeat'])
+      box_loss = tf.metrics.mean(kwargs['box_loss_repeat'])
       output_metrics = {
           'cls_loss': cls_loss,
           'box_loss': box_loss,
@@ -563,19 +534,29 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
       return output_metrics
 
     cls_loss_repeat = tf.reshape(
-        tf.tile(tf.expand_dims(cls_loss, 0), [params['batch_size'],]),
-        [params['batch_size'], 1])
+        tf.tile(tf.expand_dims(cls_loss, 0), [
+            params['batch_size'],
+        ]), [params['batch_size'], 1])
     box_loss_repeat = tf.reshape(
-        tf.tile(tf.expand_dims(box_loss, 0), [params['batch_size'],]),
-        [params['batch_size'], 1])
+        tf.tile(tf.expand_dims(box_loss, 0), [
+            params['batch_size'],
+        ]), [params['batch_size'], 1])
+
+    cls_outputs = postprocess.to_list(cls_outputs)
+    box_outputs = postprocess.to_list(box_outputs)
+    params['nms_configs']['max_nms_inputs'] = anchors.MAX_DETECTION_POINTS
+    boxes, scores, classes = postprocess.pre_nms(params, cls_outputs,
+                                                 box_outputs)
     metric_fn_inputs = {
         'cls_loss_repeat': cls_loss_repeat,
         'box_loss_repeat': box_loss_repeat,
-        'source_ids': labels['source_ids'],
+        'image_ids': labels['source_ids'],
         'groundtruth_data': labels['groundtruth_data'],
         'image_scales': labels['image_scales'],
+        'boxes': boxes,
+        'scores': scores,
+        'classes': classes,
     }
-    add_metric_fn_inputs(params, cls_outputs, box_outputs, metric_fn_inputs)
     eval_metrics = (metric_fn, metric_fn_inputs)
 
   checkpoint = params.get('ckpt') or params.get('backbone_ckpt')
@@ -605,12 +586,12 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
           ckpt_path=checkpoint,
           ckpt_scope=ckpt_scope,
           var_scope=var_scope,
-          var_exclude_expr=params.get('var_exclude_expr', None))
+          skip_mismatch=params['skip_mismatch'])
 
       tf.train.init_from_checkpoint(checkpoint, var_map)
-
       return tf.train.Scaffold()
   elif mode == tf.estimator.ModeKeys.EVAL and moving_average_decay:
+
     def scaffold_fn():
       """Load moving average variables for eval."""
       logging.info('Load EMA vars with ema_decay=%f', moving_average_decay)
@@ -620,41 +601,83 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
   else:
     scaffold_fn = None
 
-  return tf.estimator.tpu.TPUEstimatorSpec(
-      mode=mode,
-      loss=total_loss,
-      train_op=train_op,
-      eval_metrics=eval_metrics,
-      host_call=utils.get_tpu_host_call(global_step, params),
-      scaffold_fn=scaffold_fn)
+  if is_tpu:
+    return tf.estimator.tpu.TPUEstimatorSpec(
+        mode=mode,
+        loss=total_loss,
+        train_op=train_op,
+        eval_metrics=eval_metrics,
+        host_call=utils.get_tpu_host_call(global_step, params),
+        scaffold_fn=scaffold_fn,
+        training_hooks=training_hooks)
+  else:
+    # Profile every 1K steps.
+    if params.get('profile', False):
+      profile_hook = tf.estimator.ProfilerHook(
+          save_steps=1000, output_dir=params['model_dir'], show_memory=True)
+      training_hooks.append(profile_hook)
 
+      # Report memory allocation if OOM; it will slow down the running.
+      class OomReportingHook(tf.estimator.SessionRunHook):
 
-def retinanet_model_fn(features, labels, mode, params):
-  """RetinaNet model."""
-  return _model_fn(
-      features,
-      labels,
-      mode,
-      params,
-      model=retinanet_arch.retinanet,
-      variable_filter_fn=retinanet_arch.remove_variables)
+        def before_run(self, run_context):
+          return tf.estimator.SessionRunArgs(
+              fetches=[],
+              options=tf.RunOptions(report_tensor_allocations_upon_oom=True))
+
+      training_hooks.append(OomReportingHook())
+
+    logging_hook = tf.estimator.LoggingTensorHook(
+        {
+            'step': global_step,
+            'det_loss': det_loss,
+            'cls_loss': cls_loss,
+            'box_loss': box_loss,
+        },
+        every_n_iter=params.get('iterations_per_loop', 100),
+    )
+    training_hooks.append(logging_hook)
+
+    if params['device']['nvgpu_logging']:
+      try:
+        from third_party.tools import nvgpu  # pylint: disable=g-import-not-at-top
+        mem_message = tf.numpy_function(nvgpu.gpu_memory_util_message, [],
+                                        [tf.string])[0]
+        logging_hook_nvgpu = tf.estimator.LoggingTensorHook(
+            tensors={'mem_message': mem_message},
+            every_n_iter=params.get('iterations_per_loop', 100),
+            formatter=lambda x: x['mem_message'].decode('utf-8'),
+        )
+        training_hooks.append(logging_hook_nvgpu)
+      except:  # pylint: disable=bare-except
+        logging.error('nvgpu error: nvidia-smi format not recognized.')
+
+    eval_metric_ops = (
+        eval_metrics[0](**eval_metrics[1]) if eval_metrics else None)
+    return tf.estimator.EstimatorSpec(
+        mode=mode,
+        loss=total_loss,
+        train_op=train_op,
+        eval_metric_ops=eval_metric_ops,
+        scaffold=scaffold_fn() if scaffold_fn else None,
+        training_hooks=training_hooks)
 
 
 def efficientdet_model_fn(features, labels, mode, params):
   """EfficientDet model."""
+  variable_filter_fn = functools.partial(
+      efficientdet_arch.freeze_vars, pattern=params['var_freeze_expr'])
   return _model_fn(
       features,
       labels,
       mode,
       params,
-      model=efficientdet_arch.efficientdet)
+      model=efficientdet_arch.efficientdet,
+      variable_filter_fn=variable_filter_fn)
 
 
 def get_model_arch(model_name='efficientdet-d0'):
   """Get model architecture for a given model name."""
-  if 'retinanet' in model_name:
-    return retinanet_arch.retinanet
-
   if 'efficientdet' in model_name:
     return efficientdet_arch.efficientdet
 
@@ -663,9 +686,6 @@ def get_model_arch(model_name='efficientdet-d0'):
 
 def get_model_fn(model_name='efficientdet-d0'):
   """Get model fn for a given model name."""
-  if 'retinanet' in model_name:
-    return retinanet_model_fn
-
   if 'efficientdet' in model_name:
     return efficientdet_model_fn
 

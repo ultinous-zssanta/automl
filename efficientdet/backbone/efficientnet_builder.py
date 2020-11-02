@@ -17,18 +17,12 @@
 efficientnet-bx (x=0,1,2,3,4,5,6,7) checkpoints are located in:
   https://storage.googleapis.com/cloud-tpu-checkpoints/efficientnet/ckptsaug/efficientnet-bx.tar.gz
 """
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import functools
 import os
 import re
 from absl import logging
 import numpy as np
-import six
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
 import utils
 from backbone import efficientnet_model
@@ -57,10 +51,7 @@ class BlockDecoder(object):
 
   def _decode_block_string(self, block_string):
     """Gets a block through a string notation of arguments."""
-    if six.PY2:
-      assert isinstance(block_string, (str, unicode))
-    else:
-      assert isinstance(block_string, str)
+    assert isinstance(block_string, str)
     ops = block_string.split('_')
     options = {}
     for op in ops:
@@ -273,29 +264,29 @@ def build_model(images,
 
   if model_dir:
     param_file = os.path.join(model_dir, 'model_params.txt')
-    if not tf.gfile.Exists(param_file):
-      if not tf.gfile.Exists(model_dir):
-        tf.gfile.MakeDirs(model_dir)
-      with tf.gfile.GFile(param_file, 'w') as f:
+    if not tf.io.gfile.exists(param_file):
+      if not tf.io.gfile.exists(model_dir):
+        tf.io.gfile.makedirs(model_dir)
+      with tf.io.gfile.GFile(param_file, 'w') as f:
         logging.info('writing to %s', param_file)
         f.write('model_name= %s\n\n' % model_name)
         f.write('global_params= %s\n\n' % str(global_params))
         f.write('blocks_args= %s\n\n' % str(blocks_args))
 
-  with tf.variable_scope(model_name):
-    model = efficientnet_model.Model(blocks_args, global_params)
-    outputs = model(
-        images,
-        training=training,
-        features_only=features_only,
-        pooled_features_only=pooled_features_only)
+  model = efficientnet_model.Model(blocks_args, global_params, model_name)
+  outputs = model(
+      images,
+      training=training,
+      features_only=features_only,
+      pooled_features_only=pooled_features_only)
+  features, endpoints = outputs[0], outputs[1:]
   if features_only:
-    outputs = tf.identity(outputs, 'features')
+    features = tf.identity(features, 'features')
   elif pooled_features_only:
-    outputs = tf.identity(outputs, 'pooled_features')
+    features = tf.identity(features, 'pooled_features')
   else:
-    outputs = tf.identity(outputs, 'logits')
-  return outputs, model.endpoints
+    features = tf.identity(features, 'logits')
+  return features, endpoints
 
 
 def build_model_base(images, model_name, training, override_params=None):
@@ -323,9 +314,6 @@ def build_model_base(images, model_name, training, override_params=None):
 
   blocks_args, global_params = get_model_params(model_name, override_params)
 
-  with tf.variable_scope(model_name):
-    model = efficientnet_model.Model(blocks_args, global_params)
-    features = model(images, training=training, features_only=True)
-
-  features = tf.identity(features, 'features')
-  return features, model.endpoints
+  model = efficientnet_model.Model(blocks_args, global_params, model_name)
+  outputs = model(images, training=training, features_only=True)
+  return outputs[0], outputs[1:]

@@ -13,13 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for utils."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
-
 from absl import logging
 import tensorflow.compat.v1 as tf
 
@@ -69,6 +63,85 @@ class UtilsTest(tf.test.TestCase):
     self.assertTrue(tf.io.gfile.exists(os.path.join(model_dir, 'archive')))
     self.assertTrue(tf.io.gfile.exists(os.path.join(model_dir, 'backup')))
 
+  def test_image_size(self):
+    self.assertEqual(utils.parse_image_size('1280x640'), (640, 1280))
+    self.assertEqual(utils.parse_image_size(1280), (1280, 1280))
+    self.assertEqual(utils.parse_image_size((1280, 640)), (1280, 640))
+
+  def test_get_feat_sizes(self):
+    feats = utils.get_feat_sizes(640, 2)
+    self.assertEqual(feats, [{
+        'height': 640,
+        'width': 640
+    }, {
+        'height': 320,
+        'width': 320
+    }, {
+        'height': 160,
+        'width': 160
+    }])
+
+    feats = utils.get_feat_sizes((640, 300), 2)
+    self.assertEqual(feats, [{
+        'height': 640,
+        'width': 300,
+    }, {
+        'height': 320,
+        'width': 150,
+    }, {
+        'height': 160,
+        'width': 75,
+    }])
+
+  def test_precision_float16(self):
+    def _model(inputs):
+      x = tf.ones((4, 4, 4, 4), dtype='float32')
+      conv = tf.keras.layers.Conv2D(filters=4, kernel_size=2, use_bias=False)
+      a = tf.Variable(1.0)
+      return tf.cast(a, inputs.dtype) * conv(x) * inputs
+
+    x = tf.constant(2.0, dtype=tf.float32)  # input can be any type.
+    out = utils.build_model_with_precision('mixed_float16', _model, x, False)
+    # Variables should be float32.
+    for v in tf.global_variables():
+      self.assertIn(v.dtype, (tf.float32, tf.dtypes.as_dtype('float32_ref')))
+    self.assertIs(out.dtype, tf.float16)  # output should be float16.
+
+
+class ActivationTest(tf.test.TestCase):
+
+  def test_swish(self):
+    features = tf.constant([.5, 10])
+
+    result = utils.activation_fn(features, 'swish')
+    expected = features * tf.sigmoid(features)
+    self.assertAllClose(result, expected)
+
+    result = utils.activation_fn(features, 'swish_native')
+    self.assertAllClose(result, expected)
+
+  def test_hswish(self):
+    features = tf.constant([.5, 10])
+    result = utils.activation_fn(features, 'hswish')
+    self.assertAllClose(result, [0.29166667, 10.0])
+
+  def test_relu(self):
+    features = tf.constant([.5, 10])
+    result = utils.activation_fn(features, 'relu')
+    self.assertAllClose(result, [0.5, 10])
+
+  def test_relu6(self):
+    features = tf.constant([.5, 10])
+    result = utils.activation_fn(features, 'relu6')
+    self.assertAllClose(result, [0.5, 6])
+
+  def test_mish(self):
+    features = tf.constant([.5, 10])
+    result = utils.activation_fn(features, 'mish')
+    self.assertAllClose(result, [0.37524524, 10.0])
+
 
 if __name__ == '__main__':
+  logging.set_verbosity(logging.WARNING)
+  tf.disable_eager_execution()
   tf.test.main()

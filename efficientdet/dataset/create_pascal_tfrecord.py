@@ -18,15 +18,14 @@ Example usage:
     python create_pascal_tfrecord.py  --data_dir=/tmp/VOCdevkit  \
         --year=VOC2012  --output_path=/tmp/pascal
 """
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import hashlib
 import io
 import json
-import logging
 import os
+
+from absl import app
+from absl import flags
+from absl import logging
 
 from lxml import etree
 import PIL.Image
@@ -34,8 +33,6 @@ import tensorflow.compat.v1 as tf
 
 from dataset import tfrecord_util
 
-
-flags = tf.app.flags
 flags.DEFINE_string('data_dir', '', 'Root directory to raw PASCAL VOC dataset.')
 flags.DEFINE_string('set', 'train', 'Convert training set, validation set or '
                     'merged set.')
@@ -55,12 +52,28 @@ SETS = ['train', 'val', 'trainval', 'test']
 YEARS = ['VOC2007', 'VOC2012', 'merged']
 
 pascal_label_map_dict = {
-    'background': 0, 'aeroplane': 1, 'bicycle': 2, 'bird': 3, 'boat': 4,
-    'bottle': 5, 'bus': 6, 'car': 7, 'cat': 8, 'chair': 9, 'cow': 10,
-    'diningtable': 11, 'dog': 12, 'horse': 13, 'motorbike': 14, 'person': 15,
-    'pottedplant': 16, 'sheep': 17, 'sofa': 18, 'train': 19, 'tvmonitor': 20,
+    'background': 0,
+    'aeroplane': 1,
+    'bicycle': 2,
+    'bird': 3,
+    'boat': 4,
+    'bottle': 5,
+    'bus': 6,
+    'car': 7,
+    'cat': 8,
+    'chair': 9,
+    'cow': 10,
+    'diningtable': 11,
+    'dog': 12,
+    'horse': 13,
+    'motorbike': 14,
+    'person': 15,
+    'pottedplant': 16,
+    'sheep': 17,
+    'sofa': 18,
+    'train': 19,
+    'tvmonitor': 20,
 }
-
 
 GLOBAL_IMG_ID = 0  # global image id.
 GLOBAL_ANN_ID = 0  # global annotation id.
@@ -99,14 +112,14 @@ def dict_to_tf_example(data,
   by the raw data.
 
   Args:
-    data: dict holding PASCAL XML fields for a single image (obtained by
-      running tfrecord_util.recursive_parse_xml_to_dict)
+    data: dict holding PASCAL XML fields for a single image (obtained by running
+      tfrecord_util.recursive_parse_xml_to_dict)
     dataset_directory: Path to root directory holding PASCAL dataset
     label_map_dict: A map from string label names to integers ids.
     ignore_difficult_instances: Whether to skip difficult instances in the
       dataset  (default: False).
-    image_subdirectory: String specifying subdirectory within the
-      PASCAL dataset directory holding the actual image data.
+    image_subdirectory: String specifying subdirectory within the PASCAL dataset
+      directory holding the actual image data.
     ann_json_dict: annotation json dictionary.
 
   Returns:
@@ -141,6 +154,7 @@ def dict_to_tf_example(data,
   ymin = []
   xmax = []
   ymax = []
+  area = []
   classes = []
   classes_text = []
   truncated = []
@@ -158,6 +172,7 @@ def dict_to_tf_example(data,
       ymin.append(float(obj['bndbox']['ymin']) / height)
       xmax.append(float(obj['bndbox']['xmax']) / width)
       ymax.append(float(obj['bndbox']['ymax']) / height)
+      area.append((xmax[-1] - xmin[-1]) * (ymax[-1] - ymin[-1]))
       classes_text.append(obj['name'].encode('utf8'))
       classes.append(label_map_dict[obj['name']])
       truncated.append(int(obj['truncated']))
@@ -182,26 +197,44 @@ def dict_to_tf_example(data,
         }
         ann_json_dict['annotations'].append(ann)
 
-  example = tf.train.Example(features=tf.train.Features(feature={
-      'image/height': tfrecord_util.int64_feature(height),
-      'image/width': tfrecord_util.int64_feature(width),
-      'image/filename': tfrecord_util.bytes_feature(
-          data['filename'].encode('utf8')),
-      'image/source_id': tfrecord_util.bytes_feature(
-          str(image_id).encode('utf8')),
-      'image/key/sha256': tfrecord_util.bytes_feature(key.encode('utf8')),
-      'image/encoded': tfrecord_util.bytes_feature(encoded_jpg),
-      'image/format': tfrecord_util.bytes_feature('jpeg'.encode('utf8')),
-      'image/object/bbox/xmin': tfrecord_util.float_list_feature(xmin),
-      'image/object/bbox/xmax': tfrecord_util.float_list_feature(xmax),
-      'image/object/bbox/ymin': tfrecord_util.float_list_feature(ymin),
-      'image/object/bbox/ymax': tfrecord_util.float_list_feature(ymax),
-      'image/object/class/text': tfrecord_util.bytes_list_feature(classes_text),
-      'image/object/class/label': tfrecord_util.int64_list_feature(classes),
-      'image/object/difficult': tfrecord_util.int64_list_feature(difficult_obj),
-      'image/object/truncated': tfrecord_util.int64_list_feature(truncated),
-      'image/object/view': tfrecord_util.bytes_list_feature(poses),
-  }))
+  example = tf.train.Example(
+      features=tf.train.Features(
+          feature={
+              'image/height':
+                  tfrecord_util.int64_feature(height),
+              'image/width':
+                  tfrecord_util.int64_feature(width),
+              'image/filename':
+                  tfrecord_util.bytes_feature(data['filename'].encode('utf8')),
+              'image/source_id':
+                  tfrecord_util.bytes_feature(str(image_id).encode('utf8')),
+              'image/key/sha256':
+                  tfrecord_util.bytes_feature(key.encode('utf8')),
+              'image/encoded':
+                  tfrecord_util.bytes_feature(encoded_jpg),
+              'image/format':
+                  tfrecord_util.bytes_feature('jpeg'.encode('utf8')),
+              'image/object/bbox/xmin':
+                  tfrecord_util.float_list_feature(xmin),
+              'image/object/bbox/xmax':
+                  tfrecord_util.float_list_feature(xmax),
+              'image/object/bbox/ymin':
+                  tfrecord_util.float_list_feature(ymin),
+              'image/object/bbox/ymax':
+                  tfrecord_util.float_list_feature(ymax),
+              'image/object/area':
+                  tfrecord_util.float_list_feature(area),
+              'image/object/class/text':
+                  tfrecord_util.bytes_list_feature(classes_text),
+              'image/object/class/label':
+                  tfrecord_util.int64_list_feature(classes),
+              'image/object/difficult':
+                  tfrecord_util.int64_list_feature(difficult_obj),
+              'image/object/truncated':
+                  tfrecord_util.int64_list_feature(truncated),
+              'image/object/view':
+                  tfrecord_util.bytes_list_feature(poses),
+          }))
   return example
 
 
@@ -218,10 +251,14 @@ def main(_):
   if FLAGS.year != 'merged':
     years = [FLAGS.year]
 
-  logging.info('writing to output path: %s', FLAGS.output_path)
+  output_dir = os.path.dirname(FLAGS.output_path)
+  if not tf.io.gfile.exists(output_dir):
+    tf.io.gfile.makedirs(output_dir)
+  logging.info('Writing to output directory: %s', output_dir)
+
   writers = [
-      tf.python_io.TFRecordWriter(
-          FLAGS.output_path + '-%05d-of-%05d.tfrecord' % (i, FLAGS.num_shards))
+      tf.python_io.TFRecordWriter(FLAGS.output_path + '-%05d-of-%05d.tfrecord' %
+                                  (i, FLAGS.num_shards))
       for i in range(FLAGS.num_shards)
   ]
 
@@ -238,15 +275,17 @@ def main(_):
       'categories': []
   }
   for year in years:
+    example_class = list(label_map_dict.keys())[1]
+    examples_path = os.path.join(data_dir, year, 'ImageSets', 'Main',
+                                 example_class + '_' + FLAGS.set + '.txt')
+    examples_list = tfrecord_util.read_examples_list(examples_path)
+    annotations_dir = os.path.join(data_dir, year, FLAGS.annotations_dir)
+
     for class_name, class_id in label_map_dict.items():
       cls = {'supercategory': 'none', 'id': class_id, 'name': class_name}
       ann_json_dict['categories'].append(cls)
 
     logging.info('Reading from PASCAL %s dataset.', year)
-    examples_path = os.path.join(data_dir, year, 'ImageSets', 'Main',
-                                 'aeroplane_' + FLAGS.set + '.txt')
-    annotations_dir = os.path.join(data_dir, year, FLAGS.annotations_dir)
-    examples_list = tfrecord_util.read_examples_list(examples_path)
     for idx, example in enumerate(examples_list):
       if FLAGS.num_images and idx >= FLAGS.num_images:
         break
@@ -258,9 +297,12 @@ def main(_):
       xml = etree.fromstring(xml_str)
       data = tfrecord_util.recursive_parse_xml_to_dict(xml)['annotation']
 
-      tf_example = dict_to_tf_example(data, FLAGS.data_dir, label_map_dict,
-                                      FLAGS.ignore_difficult_instances,
-                                      ann_json_dict=ann_json_dict)
+      tf_example = dict_to_tf_example(
+          data,
+          FLAGS.data_dir,
+          label_map_dict,
+          FLAGS.ignore_difficult_instances,
+          ann_json_dict=ann_json_dict)
       writers[idx % FLAGS.num_shards].write(tf_example.SerializeToString())
 
   for writer in writers:
@@ -274,4 +316,4 @@ def main(_):
 
 
 if __name__ == '__main__':
-  tf.app.run()
+  app.run(main)
